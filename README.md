@@ -33,6 +33,7 @@
 9. [CoppeliaSim Entry Points](#9-coppeliasim-entry-points)
 10. [Debug Utilities](#10-debug-utilities)
 11. [Known Tunable Parameters Summary](#11-known-tunable-parameters-summary)
+12. [Known Limitations](#12-known-limitations)
 
 ---
 
@@ -60,8 +61,8 @@ The design is modular and data-driven: all physical parameters, gains, and timin
 | Mobile base | 4-wheel mecanum/omnidirectional drive |
 | Manipulator | 5-DOF serial arm (youBotArmJoint0–4) |
 | End-effector | Parallel-jaw gripper with two screw-drive joints |
-| Sensing | Down-facing proximity sensor (edge detection), wrist orientation sensor |
-| Scene objects | Up to 8 cuboid targets (`/Cuboid` through `/Cuboid6`), a flat floor, a virtual home dummy at the world origin |
+| Sensing | Down-facing proximity sensor (edge detection), wrist orientation sensor, forward-facing RGB vision sensor (`frontCam`) |
+| Scene objects | Up to 8 cuboid targets (`/Cuboid` through `/Cuboid6`), a flat floor, a virtual home dummy at the world origin, two coloured goal posts (green and red) marking the drop-off area |
 
 The script interfaces with CoppeliaSim exclusively through the `sim` API object (injected via `require("sim")` at runtime). No external Python libraries beyond the standard `math` and `traceback` modules are required.
 
@@ -90,7 +91,9 @@ youBot_script.py
 │   │   ├── forward_lateral()    — decompose base-relative position
 │   │   ├── heading_error()      — angular error to target
 │   │   ├── get_clearance_to()   — proximity via checkDistance API
-│   │   └── floor_detected()     — edge sensor proximity poll
+│   │   ├── floor_detected()     — edge sensor proximity poll
+│   │   ├── get_front_cam_rgb()  — capture RGB image from frontCam
+│   │   └── detect_goalposts()   — colour-threshold goalpost detection
 │   │
 │   ├── Base Movement — Primitives
 │   │   ├── wheels_from_twist()  — mecanum inverse kinematics
@@ -98,9 +101,10 @@ youBot_script.py
 │   │   └── _drive_for_duration()— timed open-loop drive
 │   │
 │   ├── Navigation Actions
-│   │   ├── turn_to_face_target()   — P-controller yaw alignment
-│   │   ├── drive_to_stop()         — P-controller approach + stop
-│   │   ├── drive_to_floor_edge()   — edge-seeking drive loop
+│   │   ├── turn_to_face_target()        — P-controller yaw alignment
+│   │   ├── drive_to_stop()              — P-controller approach + stop
+│   │   ├── drive_to_floor_edge()        — edge-seeking drive loop
+│   │   ├── drive_to_dropzone_visual()   — camera-guided goalpost alignment + approach
 │   │   └── return_base_to_world_origin() — home navigation
 │   │
 │   ├── Arm Movement — Primitives
@@ -232,6 +236,65 @@ All parameters are stored in the module-level `CFG` dictionary. Values can be mo
 | `edge_reverse_s` | `1.0 s` | Duration of reverse drive after drop |
 | `edge_reverse_speed` | `-0.04 m/s` | Speed of reverse drive after drop |
 
+### Vision-Guided Drop Zone (Goal Posts)
+
+The robot uses a forward-facing RGB vision sensor (`frontCam`) to locate a pair of coloured goal posts — one green, one red — that mark the boundaries of the drop-off area. Once both posts are detected the robot visually servo-drives between them and then transitions to the standard floor-edge drop.
+
+#### Camera / Scene
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `front_cam_path` | `":/frontCam"` | Path to the forward-facing vision sensor (model-relative); use `"/frontCam"` if the sensor lives at the scene root |
+
+#### Colour Thresholds (RGB 0–255)
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `gp_green_min` | `[0, 180, 0]` | Lower bound for green post pixels (R, G, B) |
+| `gp_green_max` | `[80, 255, 80]` | Upper bound for green post pixels |
+| `gp_red_min` | `[180, 0, 0]` | Lower bound for red post pixels |
+| `gp_red_max` | `[255, 80, 80]` | Upper bound for red post pixels |
+| `gp_min_pixels` | `40` | Minimum pixel count for a colour blob to be accepted as a post detection |
+| `gp_y0_frac` | `0.0` | Top fraction of the image to include in colour scanning (0 = top row) |
+| `gp_y1_frac` | `1.0` | Bottom fraction of the image to include (1 = bottom row) |
+| `gp_stride` | `1` | Pixel stride when scanning the image (increase to reduce CPU cost) |
+
+#### Visual Servo Control
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `gp_kp_omega` | `0.6` | Proportional turning gain from horizontal pixel centring error |
+| `gp_max_omega` | `0.35 rad/s` | Saturation limit on yaw-rate command from visual servo |
+| `gp_omega_sign` | `1.0` | Flip to `-1.0` if the robot steers away from the posts |
+| `gp_align_tol_px` | `16 px` | Maximum pixel error to be considered centred on the gate midpoint |
+| `gp_align_stable_steps` | `2` | Consecutive aligned frames required before committing to a forward step |
+| `gp_drive_tol_px` | `40 px` | Relaxed alignment tolerance used during forward steps |
+
+#### Step-Drive Behaviour
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `gp_forward_speed` | `0.10 m/s` | Forward speed when locked onto the gate |
+| `gp_step_time` | `0.25 s` | Duration of each forward step |
+| `gp_search_omega` | `0.25 rad/s` | Rotation speed when no posts are visible (searching) |
+| `gp_timeout_s` | `200 s` | Overall timeout for the visual approach phase |
+
+#### Terminal Approach (Stage B)
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `gp_lost_hold_s` | `1.2 s` | Seconds to keep driving forward after both posts disappear (final commit) |
+| `gp_near_pixels` | `800 px` | Single-post pixel count that triggers the near-stop / terminal hold |
+| `gp_final_forward_speed` | `0.08 m/s` | Forward speed during the terminal hold phase |
+| `gp_sep_decay` | `0.7` | Smoothing (EMA) factor for the stored inter-post separation estimate |
+
+#### Early-Trigger Retry
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `gp_min_align_steps` | `2` | Minimum number of forward-step phases required before a floor-edge transition is treated as a genuine approach; fewer steps triggers a retry |
+| `gp_early_trigger_max_retries` | `3` | Maximum number of early-trigger retries before aborting |
+
 ### Miscellaneous
 
 | Key | Default | Description |
@@ -328,6 +391,7 @@ Resolves all required CoppeliaSim object handles by path and stores them as inst
 Specific responsibilities:
 - Retrieves the model root via `sim.getObject(":")`.
 - Calls `get_object_strict()` for every joint, gripper, wheel, and sensor.
+- Binds the forward-facing vision sensor (`frontCam`) to `self.front_cam` for use by the visual goal-post approach.
 - Creates (or reuses) a small scene dummy named `HOME_0_0` at the world origin; this is the navigation target for the home-return phase. Reusing an existing dummy prevents object leaks if the script is re-initialised.
 - Sets all wheel velocities to zero as a safety measure.
 
@@ -353,6 +417,17 @@ Calls `sim.checkDistance(base_ref, target_handle, threshold)` to get the minimum
 
 **`floor_detected()`**
 Polls the down-facing proximity sensor via `sim.checkProximitySensor`. Returns `(True, distance)` when the floor is detected, `(False, None)` otherwise. The floor entity handle is passed as the sensing target to avoid spurious hits from other scene objects.
+
+**`get_front_cam_rgb()`**
+Captures a fresh RGB image from the forward-facing vision sensor (`frontCam`). Calls `sim.handleVisionSensor` to ensure the image is up-to-date, then calls `sim.getVisionSensorImg` and converts the raw byte buffer to a flat `[R,G,B, R,G,B, …]` integer list. Returns `(rgb_list, width, height)`.
+
+**`detect_goalposts()`**
+Analyses the most recent camera image to locate the green and red goal posts that mark the drop-off area. For each colour it computes the horizontal centroid (`cx`) and pixel count (`n`) of all pixels whose RGB values fall within the configured min/max thresholds. Returns:
+
+- `seen_both` — `True` when both posts exceed `gp_min_pixels`.
+- `err_px` — signed horizontal error (pixels) from the midpoint of the two posts to the image centre; positive means the gate centre is to the right.
+- `img_w` — image width in pixels.
+- `info` — diagnostic dict containing `seen_g`, `seen_r`, `cx_g`, `cx_r`, `n_g`, `n_r`, and `sep` (inter-post pixel separation, when both are visible).
 
 ---
 
@@ -397,6 +472,21 @@ Closed-loop P-controller for forward approach:
 
 **`drive_to_floor_edge()`**
 Drives the robot forward at a fixed speed while polling the down-facing proximity sensor. The edge is confirmed when the sensor returns "no floor" for `edge_lost_steps` consecutive frames (debounce). After stopping, a short backward nudge (`edge_backoff_s`) ensures only the cuboid falls, not the robot.
+
+**`drive_to_dropzone_visual()`**
+Camera-guided approach to the drop-off area using the two coloured goal posts as visual beacons. The method operates in two stages:
+
+*Stage A — Visual servo alignment and step-drive:*
+- Each iteration calls `detect_goalposts()` to locate the green and red posts in the camera image.
+- If both posts are visible the robot computes the horizontal pixel error between the gate midpoint and the image centre and applies a proportional yaw correction (`gp_kp_omega`). When the error is within `gp_align_tol_px` for `gp_align_stable_steps` consecutive frames, the robot takes a short forward step (`gp_step_time`).
+- If neither post is visible the robot spins at `gp_search_omega` until at least one post reappears.
+- The floor-edge sensor is polled on every iteration; a confirmed edge immediately ends Stage A and transitions to the drop sequence.
+
+*Stage B — Terminal hold:*
+- Triggered when the posts grow very large (`gp_near_pixels`) or both posts disappear after the robot was previously aligned. The robot continues forward at `gp_final_forward_speed` for up to `gp_lost_hold_s` seconds, relying on the edge sensor for the final stop.
+
+*Early-trigger retry:*
+- If the edge is reached after fewer than `gp_min_align_steps` forward steps (robot started too close to the posts), the approach is considered a false trigger. The robot returns home and restarts the visual search. Up to `gp_early_trigger_max_retries` retries are attempted before aborting.
 
 **`return_base_to_world_origin()`**
 Convenience sequencer: calls `turn_to_face_target` then `drive_to_stop` targeting the `home_dummy` at (0,0,0).
@@ -539,24 +629,26 @@ Iterates through `CFG["pick_targets"]` in order. For each target:
 
 ```
 sysCall_init()
-  └─ init_handles()         ← bind all object handles; abort on failure
+  └─ init_handles()         ← bind all object handles (incl. frontCam); abort on failure
 
 sysCall_thread()
   └─ wait 0.2 s             ← let physics settle
   └─ run_mission_loop()
        └─ FOR EACH cuboid in pick_targets:
             turn_to_face_target()
-            drive_to_stop()         ← approach with clearance-based stop
-            go_pregrip()            ← arm phases A + B (wrist computed here)
-            pause 2.5 s             ← settle at hover
-            go_grip_ready()         ← interpolated descent
-            close_gripper()         ← incremental closure until confirmed
-            attach_object_to_grip() ← object parented, frozen, non-respondable
-            return_arm_to_neutral() ← carry pose
-            drive_to_floor_edge()   ← forward until edge detected
+            drive_to_stop()              ← approach with clearance-based stop
+            go_pregrip()                 ← arm phases A + B (wrist computed here)
+            pause 2.5 s                  ← settle at hover
+            go_grip_ready()              ← interpolated descent
+            close_gripper()              ← incremental closure until confirmed
+            attach_object_to_grip()      ← object parented, frozen, non-respondable
+            return_arm_to_neutral()      ← carry pose
+            drive_to_dropzone_visual()   ← frontCam visual servo to goal-post gate
+                                            → Stage A: align + step-drive toward posts
+                                            → Stage B: terminal hold to floor edge
             backoff (brief)
-            drop_cuboid_off_edge()  ← open gripper, detach, reverse
-            go_tucked_pose()        ← compact stow
+            drop_cuboid_off_edge()       ← open gripper, detach, reverse
+            go_tucked_pose()             ← compact stow
             return_base_to_world_origin()  ← home: turn then drive
 
 sysCall_cleanup()
@@ -587,6 +679,9 @@ CoppeliaSim's physics does not natively support kinematic constraints for graspi
 
 ### Safe Mission Loop with Exception Recovery
 Each pick cycle is wrapped in `try/finally` to guarantee wheel stop and object release even if any step raises an exception. The outer mission loop catches exceptions per-object, allowing the mission to continue to remaining targets after a single failure.
+
+### Vision-Guided Drop-Zone Navigation
+The drop-off area is marked by a green post on the left and a red post on the right, forming a gate. Rather than relying on a fixed coordinate for the drop zone, the robot uses its forward `frontCam` vision sensor to locate the posts by colour thresholding and servo-drives toward the midpoint of the gate. This makes the drop-zone approach robust to small variations in where the robot ends up after carrying a cuboid, without requiring any additional positioning infrastructure.
 
 ### Wrist Latch per Pick Cycle
 The computed wrist angle is cached after the first computation (at `go_pregrip`) and reused during `go_grip_ready`. This ensures that the arm descends to the same wrist orientation it aligned to at the hover height, without recomputing (which could give a different result as the scene geometry changes). The cache is explicitly cleared at the start of each new pick.
@@ -629,3 +724,29 @@ The following parameters are most likely to need adjustment when porting to a di
 | `grip_ready_duration_s` | Jerky descent (potential collision) | Very slow descent |
 | `pregrip_pause_s` | Arm still settling when wrist computed | Wasted simulation time |
 | `joint_move_speed` | Slow arm moves | Jerky motion, possible instability |
+| `gp_kp_omega` | Slow visual centering on goal posts | Oscillation/overshoot when aligning |
+| `gp_min_pixels` | Spurious post detections from noise | Real posts missed at distance |
+| `gp_align_tol_px` | Over-precise alignment (many micro-corrections) | Robot drives toward posts while off-centre |
+| `gp_lost_hold_s` | Robot stops short of the edge after posts disappear | Robot drives too far past the edge |
+
+---
+
+## 12. Known Limitations
+
+### Objects Too Close to Goal Posts Confuse the Visual Pathing
+
+The visual drop-zone approach relies entirely on colour thresholding to distinguish the green and red goal posts from the rest of the scene. If a picked cuboid (or any other coloured object in the scene) happens to be placed **close to, or partially overlapping, the goal posts in the camera's field of view**, the colour blobs detected by `detect_goalposts()` can include pixels from the nearby object. This corrupts the centroid calculation and shifts the perceived midpoint of the gate, causing the robot to steer off-course.
+
+**Symptoms:**
+- Robot curves to one side instead of driving straight through the gate.
+- Gate-centre pixel error oscillates or jumps unexpectedly as the robot approaches.
+- Robot enters the early-trigger retry loop even when starting at a normal distance.
+
+**Root cause:** The colour segmentation step has no depth information and cannot separate objects that overlap in 2-D image space. A cuboid resting against a goal post or another brightly coloured object in the field of view blends into the post's pixel blob.
+
+**Workarounds / mitigations:**
+- Ensure the drop zone is kept clear of other objects during the carry phase.
+- Increase `gp_min_pixels` to require larger blobs, which reduces the chance that a small overlap is misclassified as a full post.
+- Tighten the colour thresholds (`gp_green_min/max`, `gp_red_min/max`) to accept only the most saturated post pixels, reducing contamination from similar-coloured surfaces.
+- Reduce `gp_y0_frac` / `gp_y1_frac` to restrict the image scan to the vertical band where the posts actually appear, ignoring floor-level clutter.
+- A future improvement would be to add a spatial consistency check (e.g., require the detected posts to be on opposite sides of the image and separated by at least a minimum pixel distance) to reject detections that are implausibly close together.
