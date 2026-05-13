@@ -588,10 +588,12 @@ class YouBotPickController:
             lost_needed = CFG["edge_lost_steps"]
             lost = 0
 
-            # Search robustness: flip scan direction if we can't acquire both posts
+            # Search robustness: flip scan direction if we can't acquire both posts.
+            # Allow a full 360° sweep in each direction before reversing so that
+            # goalposts located anywhere around the robot are reachable.
             scan_dir = 1.0
             last_flip_t = sim.getSimulationTime()
-            flip_every_s = 6.0
+            flip_every_s = (2.0 * math.pi) / max(0.05, abs(CFG["gp_search_omega"]))
 
             # Terminal-approach parameters
             gp_lost_hold_s         = CFG["gp_lost_hold_s"]
@@ -1211,16 +1213,10 @@ class YouBotPickController:
     def drop_cuboid_off_edge(self):
         with StepLogger("Drop cuboid off edge"):
             sim.wait(CFG["edge_drop_pause_s"])
-
-            # Restore dynamic properties so the cube falls under gravity after release
-            if self.attached_object is not None:
-                try:
-                    sim.setObjectInt32Param(self.attached_object, sim.shapeintparam_static, 0)
-                    sim.setObjectInt32Param(self.attached_object, sim.shapeintparam_respondable, 1)
-                    sim.resetDynamicObject(self.attached_object)
-                except Exception as e:
-                    log_info(f"  [drop_cuboid_off_edge] failed to restore dynamics: {e}")
-
+            # open_gripper() -> detach_object_from_grip() restores static=0,
+            # respondable=1 and calls resetDynamicObject after re-parenting to
+            # world, which is the correct order for CoppeliaSim physics to pick
+            # up the object and let it fall under gravity.
             self.open_gripper()
             sim.wait(0.2)
             self._drive_for_duration(CFG["edge_reverse_speed"], CFG["edge_reverse_s"])
