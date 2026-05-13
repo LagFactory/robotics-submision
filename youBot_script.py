@@ -597,6 +597,12 @@ class YouBotPickController:
             gp_final_forward_speed = CFG["gp_final_forward_speed"]
             gp_sep_decay           = CFG["gp_sep_decay"]
 
+            # Reset per-approach state so stale data from a previous cube cycle
+            # cannot trigger a premature edge-drive transition.
+            self._gp_last_seen_t  = -1.0
+            self._gp_last_err_px  = 0.0
+            self._gp_last_sep_px  = None
+
             while not sim.getSimulationStopping():
                 if sim.getSimulationTime() - t0 > timeout:
                     raise RuntimeError("Vision dropzone timeout: could not reach/align with goalposts.")
@@ -710,7 +716,22 @@ class YouBotPickController:
                         continue
 
                     else:
-                        # --- SEARCH ---
+                        # --- SEARCH (or transition to edge drive) ---
+                        # If we previously acquired both posts but have now lost them
+                        # beyond the hold window, we must be close to the gate.
+                        # Transition straight to drive_to_floor_edge() so the cube is
+                        # dropped correctly when the sensor passes over the edge.
+                        if self._gp_last_seen_t > 0:
+                            log_info(
+                                "[gp] Both posts lost beyond hold window (previously "
+                                "acquired) → transitioning to drive_to_floor_edge"
+                            )
+                            self.stop_base()
+                            sim.wait(CFG["post_stop_settle_s"])
+                            self.drive_to_floor_edge()
+                            return
+
+                        # Posts were never acquired → keep spinning to find them
                         stable = 0
                         omega = abs(CFG["gp_search_omega"])
 
