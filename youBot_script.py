@@ -1366,7 +1366,7 @@ class YouBotPickController:
                 self.drive_to_floor_edge()
                 self.drop_cuboid_off_edge()
                 self.go_tucked_pose()
-                self.return_base_to_world_origin()
+                
 
             finally:
                 # Safety cleanup: ensure wheels stop and object is released
