@@ -635,8 +635,6 @@ class YouBotPickController:
                 # 1) Update "last seen" memory when both posts are visible
                 # -------------------------------------------------------
                 if seen_both:
-                    self._gp_last_seen_t = t_now
-                    self._gp_last_err_px = err_px
                     sep = info["sep"]
                     if self._gp_last_sep_px is None:
                         self._gp_last_sep_px = sep
@@ -645,6 +643,13 @@ class YouBotPickController:
                             gp_sep_decay * self._gp_last_sep_px
                             + (1.0 - gp_sep_decay) * sep
                         )
+                    # Only commit to the approach (activate HOLD) once the gate
+                    # has been stably centred for enough consecutive frames.
+                    # A fleeting glimpse during the search sweep (stable < stable_needed)
+                    # must not launch a premature forward approach.
+                    if stable >= stable_needed:
+                        self._gp_last_seen_t = t_now
+                        self._gp_last_err_px = err_px
 
                 # -------------------------------------------------------
                 # 2) Secondary near-stop heuristic (single post, big pixel count)
