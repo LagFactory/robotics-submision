@@ -154,7 +154,7 @@ CFG = {
     "gp_align_stable_steps": 2,     # stable frames required for "locked-on"
     "gp_search_omega": 0.25,        # rad/s spin when posts not visible
     "gp_timeout_s": 200,             # overall timeout
-    "gp_omega_sign": 1.0,   # flip to -1.0 if it steers away from the posts
+    "gp_omega_sign": -1.0,  # -1.0 compensates for upside-down camera (mirrors image x-axis)
     "gp_drive_tol_px": 40,
 
     # --- Terminal approach (Stage B) ---
