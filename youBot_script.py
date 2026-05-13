@@ -653,8 +653,10 @@ class YouBotPickController:
 
                 # -------------------------------------------------------
                 # 2) Secondary near-stop heuristic (single post, big pixel count)
+                # Only active after both posts have been stably acquired at least
+                # once, so the initial search sweep always waits for both posts.
                 # -------------------------------------------------------
-                if not seen_both:
+                if not seen_both and self._gp_last_seen_t > 0:
                     seen_g = info.get("seen_g", False)
                     seen_r = info.get("seen_r", False)
                     n_g    = info.get("n_g", 0)
