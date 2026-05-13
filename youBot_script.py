@@ -121,6 +121,48 @@ CFG = {
 
     "reset_base_xy": [0.0, 0.0],   # world origin target
     "reset_base_yaw_deg": 0.0,     # yaw at reset
+    
+    
+    # --- Vision-guided drop zone (goalposts) ---
+    "front_cam_path": ":/frontCam",  # if the vision sensor is parented under the youBot model
+    # If not inside the model tree, use "/frontCam" instead.
+    
+    "gp_y0_frac": 0.0,
+    "gp_y1_frac": 1.0,
+    "gp_stride": 1,
+    "gp_min_pixels": 40,
+
+
+    # Color thresholds in RGB (0..255) for PURE colored posts:
+    "gp_green_min": [0, 180, 0],    # green: G high, R/B low
+    "gp_green_max": [80, 255, 80],
+
+    "gp_red_min":   [180, 0, 0],    # red: R high, G/B low
+    "gp_red_max":   [255, 80, 80],
+
+    # Minimum number of pixels required to accept detection:
+    
+
+    # Visual servo control:
+    "gp_kp_omega": 0.6,             # turning gain from pixel error
+    "gp_max_omega": 0.35,            # rad/s command into wheels_from_twist
+
+    # Step-drive behaviour:
+    "gp_forward_speed": 0.10,       # m/s forward when aligned
+    "gp_step_time": 0.25,           # seconds per forward step
+    "gp_align_tol_px": 16,          # must centre gate within this pixel tolerance
+    "gp_align_stable_steps": 2,     # stable frames required for "locked-on"
+    "gp_search_omega": 0.25,        # rad/s spin when posts not visible
+    "gp_timeout_s": 200,             # overall timeout
+    "gp_omega_sign": 1.0,   # flip to -1.0 if it steers away from the posts
+    "gp_drive_tol_px": 40,
+
+    # --- Terminal approach (Stage B) ---
+    "gp_lost_hold_s": 1.2,          # seconds to keep driving after both posts disappear
+    "gp_near_pixels": 800,          # single-post pixel count that triggers near-stop
+    "gp_final_forward_speed": 0.08, # forward speed during terminal hold phase
+    "gp_sep_decay": 0.7,            # smoothing factor for stored inter-post separation
+
 }
 
 
@@ -270,12 +312,20 @@ class YouBotPickController:
         self.edge_sensor  = None
         self.floor_entity = None
         self.home_dummy   = None
+        self.front_cam    = None
 
         self.attached_object       = None
         self._attached_prev_parent = None
         self._attached_prev_static = None
         self._wrist_latched        = None
         self._arm_moved            = False
+
+        self.collected_cubes = []   # handles of cubes already picked up
+
+        # Visual drop-zone navigation state (Stage B terminal approach)
+        self._gp_last_seen_t  = -1.0   # sim time when both posts were last seen
+        self._gp_last_err_px  = 0.0    # last known gate-centre pixel error
+        self._gp_last_sep_px  = None   # smoothed inter-post separation (pixels)
 
     def init_handles(self):
         with StepLogger("Init handles"):
@@ -296,13 +346,13 @@ class YouBotPickController:
             self.grip_attach  = self.get_object_strict(CFG["grip_attach_path"],  label="Grip attach dummy")
             self.wrist_sensor = self.get_object_strict(":/wristOrientSensor",    label="Wrist orient sensor")
             self.edge_sensor  = self.get_object_strict(CFG["edge_sensor_path"],  label="Edge sensor (down)")
-
+            self.front_cam = self.get_object_strict(CFG["front_cam_path"], label="Front vision sensor (frontCam)")
             # Floor entity (optional)
             if CFG.get("floor_entity_path"):
                 h = sim.getObject(CFG["floor_entity_path"], {"noError": True})
                 self.floor_entity = h if h != -1 else None
 
-            # Home dummy — reuse existing to avoid leaking scene objects on re-init
+            # Home dummy ? reuse existing to avoid leaking scene objects on re-init
             existing = sim.getObject("/HOME_0_0", {"noError": True})
             if existing != -1:
                 self.home_dummy = existing
@@ -372,7 +422,7 @@ class YouBotPickController:
         return False, None
 
     # -------------------------------------------------------------------------
-    # Base movement — primitives
+    # Base movement ? primitives
     # -------------------------------------------------------------------------
 
     def wheels_from_twist(self, vx, vy, omega):
@@ -408,7 +458,7 @@ class YouBotPickController:
         self.stop_base()
 
     # -------------------------------------------------------------------------
-    # Base movement — navigation actions
+    # Base movement ? navigation actions
     # -------------------------------------------------------------------------
 
     def turn_to_face_target(self, target_handle, label="Turn to face target"):
@@ -450,9 +500,9 @@ class YouBotPickController:
                       label="Drive to target"):
         """Drive toward target_handle and halt at stop_distance.
 
-        use_clearance=True  — stop criterion is checkDistance clearance
+        use_clearance=True  ? stop criterion is checkDistance clearance
                               (used for cuboid approach, more accurate near objects).
-        use_clearance=False — stop criterion is planar getObjectPosition distance
+        use_clearance=False ? stop criterion is planar getObjectPosition distance
                               (used for home navigation).
         """
         with StepLogger(label):
@@ -520,7 +570,272 @@ class YouBotPickController:
 
             self.stop_base()
             sim.wait(CFG["post_stop_settle_s"])
+            
+            
 
+    def drive_to_dropzone_visual(self):
+        with StepLogger("Drive to drop zone using frontCam + goalposts"):
+            dt      = CFG["dt"]
+            wmax    = CFG["wheel_speed_max"]
+            t0      = sim.getSimulationTime()
+            timeout = CFG["gp_timeout_s"]
+
+            tol_px        = CFG["gp_align_tol_px"]
+            stable_needed = CFG["gp_align_stable_steps"]
+            stable        = 0
+
+            # Edge confirmation (avoid 1-frame flicker)
+            lost_needed = CFG["edge_lost_steps"]
+            lost = 0
+
+            # Search robustness: flip scan direction if we can't acquire both posts.
+            # Allow a full 360° sweep in each direction before reversing so that
+            # goalposts located anywhere around the robot are reachable.
+            scan_dir = 1.0
+            last_flip_t = sim.getSimulationTime()
+            flip_every_s = (2.0 * math.pi) / max(0.05, abs(CFG["gp_search_omega"]))
+
+            # Terminal-approach parameters
+            gp_lost_hold_s         = CFG["gp_lost_hold_s"]
+            gp_near_pixels         = CFG["gp_near_pixels"]
+            gp_final_forward_speed = CFG["gp_final_forward_speed"]
+            gp_sep_decay           = CFG["gp_sep_decay"]
+
+            # Reset per-approach state so stale data from a previous cube cycle
+            # cannot trigger a premature edge-drive transition.
+            self._gp_last_seen_t  = -1.0
+            self._gp_last_err_px  = 0.0
+            self._gp_last_sep_px  = None
+
+            while not sim.getSimulationStopping():
+                if sim.getSimulationTime() - t0 > timeout:
+                    raise RuntimeError("Vision dropzone timeout: could not reach/align with goalposts.")
+
+                # --- Primary stop condition: edge reached (with confirmation) ---
+                detected, _ = self.floor_detected()
+                if detected:
+                    lost = 0
+                else:
+                    lost += 1
+
+                if lost >= lost_needed:
+                    self.stop_base()
+                    sim.wait(CFG["post_stop_settle_s"])
+                    if CFG["edge_backoff_s"] > 0:
+                        self._drive_for_duration(CFG["edge_backoff_speed"], CFG["edge_backoff_s"])
+                        sim.wait(CFG["post_stop_settle_s"])
+                    return
+
+                # --- Vision sensing ---
+                seen_both, err_px, img_w, info = self.detect_goalposts()
+
+                t_now = sim.getSimulationTime()
+
+                # -------------------------------------------------------
+                # 1) Update "last seen" memory when both posts are visible
+                # -------------------------------------------------------
+                if seen_both:
+                    sep = info["sep"]
+                    if self._gp_last_sep_px is None:
+                        self._gp_last_sep_px = sep
+                    else:
+                        self._gp_last_sep_px = (
+                            gp_sep_decay * self._gp_last_sep_px
+                            + (1.0 - gp_sep_decay) * sep
+                        )
+                    # Only commit to the approach (activate HOLD) once the gate
+                    # has been stably centred for enough consecutive frames.
+                    # A fleeting glimpse during the search sweep (stable < stable_needed)
+                    # must not launch a premature forward approach.
+                    if stable >= stable_needed:
+                        self._gp_last_seen_t = t_now
+                        self._gp_last_err_px = err_px
+
+                # -------------------------------------------------------
+                # 2) Secondary near-stop heuristic (single post, big pixel count)
+                # -------------------------------------------------------
+                if not seen_both:
+                    seen_g = info.get("seen_g", False)
+                    seen_r = info.get("seen_r", False)
+                    n_g    = info.get("n_g", 0)
+                    n_r    = info.get("n_r", 0)
+                    one_post_big = (
+                        (seen_g and not seen_r and n_g >= gp_near_pixels) or
+                        (seen_r and not seen_g and n_r >= gp_near_pixels)
+                    )
+                    if one_post_big:
+                        log_info(
+                            f"[gp] Near-stop: single post pixel count "
+                            f"n_g={n_g} n_r={n_r} >= {gp_near_pixels}"
+                        )
+                        self.stop_base()
+                        sim.wait(CFG["post_stop_settle_s"])
+                        if CFG["edge_backoff_s"] > 0:
+                            self._drive_for_duration(CFG["edge_backoff_speed"], CFG["edge_backoff_s"])
+                            sim.wait(CFG["post_stop_settle_s"])
+                        return
+
+                # -------------------------------------------------------
+                # 3) Not seen_both: HOLD or SEARCH
+                # -------------------------------------------------------
+                if not seen_both:
+                    # Flip scan direction occasionally when fully lost
+                    if (not info.get("seen_g")) and (not info.get("seen_r")):
+                        if (t_now - last_flip_t) > flip_every_s:
+                            scan_dir *= -1.0
+                            last_flip_t = t_now
+
+                    time_since_seen = t_now - self._gp_last_seen_t
+
+                    if time_since_seen <= gp_lost_hold_s:
+                        # --- HOLD / TERMINAL APPROACH ---
+                        seen_g = info.get("seen_g", False)
+                        seen_r = info.get("seen_r", False)
+                        cx_g   = info.get("cx_g")
+                        cx_r   = info.get("cx_r")
+
+                        half_img_w = img_w / 2.0
+                        if self._gp_last_sep_px is not None:
+                            if seen_g and not seen_r and cx_g is not None:
+                                center_est = cx_g + self._gp_last_sep_px / 2.0
+                                err_est = center_est - half_img_w
+                            elif seen_r and not seen_g and cx_r is not None:
+                                center_est = cx_r - self._gp_last_sep_px / 2.0
+                                err_est = center_est - half_img_w
+                            else:
+                                err_est = self._gp_last_err_px
+                        else:
+                            err_est = self._gp_last_err_px
+
+                        err_norm = err_est / max(1.0, half_img_w)
+                        omega = clamp(
+                            CFG["gp_kp_omega"] * err_norm,
+                            -CFG["gp_max_omega"], CFG["gp_max_omega"]
+                        )
+                        omega *= CFG["gp_omega_sign"]
+
+                        vx = CFG["vx_sign"] * gp_final_forward_speed
+
+                        ws = self.wheels_from_twist(vx, 0.0, omega)
+                        ws = [clamp(w, -wmax, wmax) for w in ws]
+                        for h, w in zip(self.wheels, ws):
+                            sim.setJointTargetVelocity(h, w)
+
+                        sim.wait(dt)
+                        continue
+
+                    else:
+                        # --- SEARCH (or transition to edge drive) ---
+                        # If we previously acquired both posts but have now lost them
+                        # beyond the hold window, we must be close to the gate.
+                        # Transition straight to drive_to_floor_edge() so the cube is
+                        # dropped correctly when the sensor passes over the edge.
+                        if self._gp_last_seen_t > 0:
+                            log_info(
+                                "[gp] Both posts lost beyond hold window (previously "
+                                "acquired) ? transitioning to drive_to_floor_edge"
+                            )
+                            self.stop_base()
+                            sim.wait(CFG["post_stop_settle_s"])
+                            self.drive_to_floor_edge()
+                            return
+
+                        # Posts were never acquired ? keep spinning to find them
+                        stable = 0
+                        omega = abs(CFG["gp_search_omega"])
+
+                        # Alternate direction only when no posts at all
+                        if (not info.get("seen_g")) and (not info.get("seen_r")):
+                            omega *= scan_dir
+
+                        # Base rotation sign for scan
+                        omega *= CFG["omega_sign"]
+
+                        ws = self.wheels_from_twist(0.0, 0.0, omega)
+                        ws = [clamp(w, -wmax, wmax) for w in ws]
+                        for h, w in zip(self.wheels, ws):
+                            sim.setJointTargetVelocity(h, w)
+
+                        sim.wait(dt)
+                        continue
+
+                # -------------------------------------------------------
+                # 4) seen_both: normal ALIGN + forward policy (Stage A)
+                # -------------------------------------------------------
+
+                # Stable-frame counter with decay
+                if abs(err_px) <= tol_px:
+                    stable = min(stable + 1, stable_needed)
+                else:
+                    stable = max(stable - 1, 0)
+
+                # Closed-loop omega from pixel error
+                err_norm = err_px / max(1.0, img_w * 0.5)
+                omega = clamp(
+                    CFG["gp_kp_omega"] * err_norm,
+                    -CFG["gp_max_omega"], CFG["gp_max_omega"]
+                )
+                omega *= CFG["gp_omega_sign"]
+
+                # Forward motion policy
+                drive_tol = CFG.get("gp_drive_tol_px", 3 * tol_px)
+                err_abs   = abs(err_px)
+
+                if err_abs <= drive_tol:
+                    vx = CFG["vx_sign"] * (0.5 * CFG["gp_forward_speed"])  # creep
+                else:
+                    vx = 0.0
+
+                # Full speed when fully stable
+                if stable >= stable_needed and err_abs <= tol_px:
+                    vx = CFG["vx_sign"] * CFG["gp_forward_speed"]
+
+                ws = self.wheels_from_twist(vx, 0.0, omega)
+                ws = [clamp(w, -wmax, wmax) for w in ws]
+                for h, w in zip(self.wheels, ws):
+                    sim.setJointTargetVelocity(h, w)
+
+                # --- Step-forward phase ---
+                if stable >= stable_needed and err_abs <= tol_px:
+                    t_end = sim.getSimulationTime() + CFG["gp_step_time"]
+
+                    while not sim.getSimulationStopping() and sim.getSimulationTime() < t_end:
+                        # Edge check during step
+                        detected2, _ = self.floor_detected()
+                        if not detected2:
+                            lost += 1
+                            if lost >= lost_needed:
+                                break
+                        else:
+                            lost = 0
+
+                        seen2, err_px2, img_w2, info2 = self.detect_goalposts()
+                        if not seen2:
+                            # Vision lost during step: stop and re-enter main loop
+                            break
+
+                        err_norm2 = err_px2 / max(1.0, img_w2 * 0.5)
+                        omega2 = clamp(
+                            CFG["gp_kp_omega"] * err_norm2,
+                            -CFG["gp_max_omega"], CFG["gp_max_omega"]
+                        )
+                        omega2 *= CFG["gp_omega_sign"]
+
+                        ws2 = self.wheels_from_twist(
+                            CFG["vx_sign"] * CFG["gp_forward_speed"], 0.0, omega2
+                        )
+                        ws2 = [clamp(w, -wmax, wmax) for w in ws2]
+                        for hh, ww in zip(self.wheels, ws2):
+                            sim.setJointTargetVelocity(hh, ww)
+
+                        sim.wait(dt)
+
+                    self.stop_base()
+                    sim.wait(CFG["post_stop_settle_s"])
+                    stable = 0
+                else:
+                    sim.wait(dt)
+                    
     def drive_to_floor_edge(self):
         with StepLogger("Drive to floor edge"):
             dt          = CFG["dt"]
@@ -565,7 +880,7 @@ class YouBotPickController:
             self.drive_to_stop(self.home_dummy, stop_distance=0.05, label="Drive to home (0,0)")
 
     # -------------------------------------------------------------------------
-    # Arm movement — primitives
+    # Arm movement ? primitives
     # -------------------------------------------------------------------------
 
     def move_joint_smooth(self, joint, target, speed=None, joint_name="joint"):
@@ -688,7 +1003,7 @@ class YouBotPickController:
             _signed_angle_2d(sens_dir, cube_dir_y),
         ]
 
-        # Also consider 180° flips (axis alignment is bidirectional)
+        # Also consider 180? flips (axis alignment is bidirectional)
         expanded = []
         for d in delta_candidates:
             expanded.append(_wrap_pi(d))
@@ -903,9 +1218,121 @@ class YouBotPickController:
     def drop_cuboid_off_edge(self):
         with StepLogger("Drop cuboid off edge"):
             sim.wait(CFG["edge_drop_pause_s"])
+            # open_gripper() -> detach_object_from_grip() restores static=0,
+            # respondable=1 and calls resetDynamicObject after re-parenting to
+            # world, which is the correct order for CoppeliaSim physics to pick
+            # up the object and let it fall under gravity.
             self.open_gripper()
             sim.wait(0.2)
             self._drive_for_duration(CFG["edge_reverse_speed"], CFG["edge_reverse_s"])
+            
+            
+    #---------------------------------------------------
+    #Cam stuff
+    #----------------------------------------------
+    
+    def get_front_cam_rgb(self):
+            """
+            Returns (rgb_list, w, h) where rgb_list is a flat [R,G,B,R,G,B,...] list.
+            Requires the sensor to have been handled this step.
+            """
+            # If frontCam has explicit handling enabled, we MUST handle it ourselves:
+            sim.handleVisionSensor(self.front_cam)  # ensures fresh image [3](https://manual.coppeliarobotics.com/en/sim/simGetVisionSensorImg.htm)[2](https://github.com/CoppeliaRobotics/manual/blob/master/en/textureDialog.htm)
+
+            img_bytes, res = sim.getVisionSensorImg(self.front_cam)  # bytes + [w,h] [3](https://manual.coppeliarobotics.com/en/sim/simGetVisionSensorImg.htm)
+            w, h = res[0], res[1]
+
+            # Convert bytes -> list of ints (0..255)
+            rgb = sim.unpackUInt8Table(img_bytes)  # recommended by docs [3](https://manual.coppeliarobotics.com/en/sim/simGetVisionSensorImg.htm)
+            return rgb, w, h
+            
+    
+    def _centroid_rgb_threshold(self, rgb, w, h, mn, mx):
+        """
+        Fast centroid of pixels within RGB box [mn,mx], scanning only a vertical band
+        and skipping pixels by 'gp_stride' for speed.
+        Returns (cx, count).
+        """
+        rmin, gmin, bmin = mn
+        rmax, gmax, bmax = mx
+
+        stride = CFG.get("gp_stride", 1)
+
+        # Compute y-band limits HERE (inside the function)
+        y0 = int(h * CFG.get("gp_y0_frac", 0.0))
+        y1 = int(h * CFG.get("gp_y1_frac", 1.0))
+
+        # Clamp to valid range
+        y0 = max(0, min(h, y0))
+        y1 = max(0, min(h, y1))
+        if y1 <= y0:
+            y0, y1 = 0, h  # fallback
+
+        count = 0
+        xsum = 0
+
+        for y in range(y0, y1, stride):
+            row_base = (y * w) * 3
+            for x in range(0, w, stride):
+                idx = row_base + x * 3
+                r = rgb[idx]
+                g = rgb[idx + 1]
+                b = rgb[idx + 2]
+
+                if (rmin <= r <= rmax) and (gmin <= g <= gmax) and (bmin <= b <= bmax):
+                    count += 1
+                    xsum += x
+
+        if count == 0:
+            return None, 0
+
+        return xsum / count, count
+
+
+        
+    
+    
+    def detect_goalposts(self):
+        """
+        Returns:
+          seen_both (bool),
+          err_px (float)      = (center_x - w/2) if both seen else 0
+          w (int)
+          info (dict): always includes seen_g, seen_r, cx_g, cx_r, n_g, n_r;
+                       also includes 'sep' (cx_r - cx_g) when both are seen.
+        """
+        rgb, w, h = self.get_front_cam_rgb()
+
+        cx_g, n_g = self._centroid_rgb_threshold(rgb, w, h, CFG["gp_green_min"], CFG["gp_green_max"])
+        cx_r, n_r = self._centroid_rgb_threshold(rgb, w, h, CFG["gp_red_min"],   CFG["gp_red_max"])
+
+        minpix = CFG["gp_min_pixels"]
+        seen_g = (cx_g is not None) and (n_g >= minpix)
+        seen_r = (cx_r is not None) and (n_r >= minpix)
+
+        info = {
+            "seen_g": seen_g, "seen_r": seen_r,
+            "cx_g": cx_g,     "cx_r": cx_r,
+            "n_g": n_g,       "n_r": n_r,
+        }
+
+        if int(sim.getSimulationTime() / CFG["dt"]) % 10 == 0:
+            log_info(
+                f"[gp] n_g={n_g} n_r={n_r} seen_g={seen_g} seen_r={seen_r} "
+                f"cx_g={cx_g} cx_r={cx_r} w={w} err={(0.5*(cx_g+cx_r)-w*0.5) if (seen_g and seen_r) else None}"
+            )
+
+        if not (seen_g and seen_r):
+            return False, 0.0, w, info
+
+        sep    = cx_r - cx_g
+        center = 0.5 * (cx_g + cx_r)
+        err_px = center - (w * 0.5)
+        info["sep"] = sep
+        return True, err_px, w, info
+
+
+    
 
     # -------------------------------------------------------------------------
     # Mission
@@ -935,11 +1362,11 @@ class YouBotPickController:
 
                 self._arm_moved = False   # arm back to neutral after this point
                 self.return_arm_to_neutral()
+                self.drive_to_dropzone_visual()
                 self.drive_to_floor_edge()
                 self.drop_cuboid_off_edge()
-
                 self.go_tucked_pose()
-                self.return_base_to_world_origin()
+                
 
             finally:
                 # Safety cleanup: ensure wheels stop and object is released
@@ -954,24 +1381,55 @@ class YouBotPickController:
 
     def run_mission_loop(self):
         with StepLogger("MISSION LOOP"):
-            for path in CFG["pick_targets"]:
-                h = sim.getObject(path, {"noError": True})
-                if h == -1:
-                    log_info(f"[skip] missing {path}")
-                    continue
+            while True:
+                # Build list of uncollected, available cube handles
+                candidates = []
+                for path in CFG["pick_targets"]:
+                    h = sim.getObject(path, {"noError": True})
+                    if h == -1:
+                        log_info(f"[skip] missing {path}")
+                        continue
+                    if h in self.collected_cubes:
+                        continue
+                    candidates.append((path, h))
 
-                log_info(f"[mission] picking {path}")
+                if not candidates:
+                    log_info("[mission] all cubes collected or unavailable")
+                    break
+
+                # Pick the closest uncollected cube
+                best_path, best_h, best_dist = None, None, float('inf')
+                for path, h in candidates:
+                    rel  = sim.getObjectPosition(h, self.base_ref)
+                    dist = math.hypot(rel[0], rel[1])
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_path = path
+                        best_h    = h
+
+                log_info(f"[mission] picking closest: {best_path} dist={best_dist:.3f}m "
+                         f"(collected so far: {len(self.collected_cubes)})")
                 try:
-                    self.pick_and_drop_one(h)
+                    self.pick_and_drop_one(best_h)
+                    self.collected_cubes.append(best_h)
+                    aliases = []
+                    for c in self.collected_cubes:
+                        try:
+                            aliases.append(sim.getObjectAlias(c, 1))
+                        except Exception:
+                            aliases.append(str(c))
+                    log_info(f"[mission] collected {len(self.collected_cubes)} cube(s): {aliases}")
                 except Exception as e:
                     log_info(
-                        f"[mission] failed on {path}: {e}\n{traceback.format_exc()}"
+                        f"[mission] failed on {best_path}: {e}\n{traceback.format_exc()}"
                     )
+                    # Mark as attempted so we don't retry a broken cube indefinitely
+                    self.collected_cubes.append(best_h)
                     continue
 
 
 # -----------------------------------------------------------------------
-# DEBUG UTILITIES — not called during normal mission; kept for manual use
+# DEBUG UTILITIES ? not called during normal mission; kept for manual use
 # -----------------------------------------------------------------------
 
 def _debug_reset_robot_to_world_origin(ctrl):
