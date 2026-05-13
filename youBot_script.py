@@ -163,6 +163,15 @@ CFG = {
     "gp_final_forward_speed": 0.08, # forward speed during terminal hold phase
     "gp_sep_decay": 0.7,            # smoothing factor for stored inter-post separation
 
+    # --- Early-trigger retry ---
+    # If the robot sees the goalposts and immediately commits to drive_to_floor_edge
+    # after only a small number of forward-step phases (e.g. started too close),
+    # it returns home and restarts the visual search instead.
+    "gp_min_align_steps": 2,          # minimum step-forward phases before a floor-edge
+                                       # transition is considered a genuine approach
+                                       # (if step_count <= this, it's an early trigger)
+    "gp_early_trigger_max_retries": 3, # how many times to retry after an early trigger
+
 }
 
 
@@ -577,23 +586,13 @@ class YouBotPickController:
         with StepLogger("Drive to drop zone using frontCam + goalposts"):
             dt      = CFG["dt"]
             wmax    = CFG["wheel_speed_max"]
-            t0      = sim.getSimulationTime()
             timeout = CFG["gp_timeout_s"]
 
             tol_px        = CFG["gp_align_tol_px"]
             stable_needed = CFG["gp_align_stable_steps"]
-            stable        = 0
 
             # Edge confirmation (avoid 1-frame flicker)
             lost_needed = CFG["edge_lost_steps"]
-            lost = 0
-
-            # Search robustness: flip scan direction if we can't acquire both posts.
-            # Allow a full 360° sweep in each direction before reversing so that
-            # goalposts located anywhere around the robot are reachable.
-            scan_dir = 1.0
-            last_flip_t = sim.getSimulationTime()
-            flip_every_s = (2.0 * math.pi) / max(0.05, abs(CFG["gp_search_omega"]))
 
             # Terminal-approach parameters
             gp_lost_hold_s         = CFG["gp_lost_hold_s"]
@@ -601,73 +600,42 @@ class YouBotPickController:
             gp_final_forward_speed = CFG["gp_final_forward_speed"]
             gp_sep_decay           = CFG["gp_sep_decay"]
 
-            # Reset per-approach state so stale data from a previous cube cycle
-            # cannot trigger a premature edge-drive transition.
-            self._gp_last_seen_t  = -1.0
-            self._gp_last_err_px  = 0.0
-            self._gp_last_sep_px  = None
+            # Early-trigger retry settings
+            min_align_steps = CFG["gp_min_align_steps"]
+            max_retries     = CFG["gp_early_trigger_max_retries"]
 
-            while not sim.getSimulationStopping():
-                if sim.getSimulationTime() - t0 > timeout:
-                    raise RuntimeError("Vision dropzone timeout: could not reach/align with goalposts.")
+            for _attempt in range(max_retries + 1):
+                t0          = sim.getSimulationTime()
+                stable      = 0
+                lost        = 0
+                scan_dir    = 1.0
+                last_flip_t = t0
+                flip_every_s = (2.0 * math.pi) / max(0.05, abs(CFG["gp_search_omega"]))
 
-                # --- Primary stop condition: edge reached (with confirmation) ---
-                detected, _ = self.floor_detected()
-                if detected:
-                    lost = 0
-                else:
-                    lost += 1
+                # step_count tracks how many forward-step phases have been completed
+                # during this attempt; used to detect premature (early-trigger) exits.
+                step_count = 0
 
-                if lost >= lost_needed:
-                    self.stop_base()
-                    sim.wait(CFG["post_stop_settle_s"])
-                    if CFG["edge_backoff_s"] > 0:
-                        self._drive_for_duration(CFG["edge_backoff_speed"], CFG["edge_backoff_s"])
-                        sim.wait(CFG["post_stop_settle_s"])
-                    return
+                # Reset per-approach state so stale data from a previous cube cycle
+                # cannot trigger a premature edge-drive transition.
+                self._gp_last_seen_t  = -1.0
+                self._gp_last_err_px  = 0.0
+                self._gp_last_sep_px  = None
 
-                # --- Vision sensing ---
-                seen_both, err_px, img_w, info = self.detect_goalposts()
+                _early_trigger = False  # set True when retry is needed
 
-                t_now = sim.getSimulationTime()
+                while not sim.getSimulationStopping():
+                    if sim.getSimulationTime() - t0 > timeout:
+                        raise RuntimeError("Vision dropzone timeout: could not reach/align with goalposts.")
 
-                # -------------------------------------------------------
-                # 1) Update "last seen" memory when both posts are visible
-                # -------------------------------------------------------
-                if seen_both:
-                    sep = info["sep"]
-                    if self._gp_last_sep_px is None:
-                        self._gp_last_sep_px = sep
+                    # --- Primary stop condition: edge reached (with confirmation) ---
+                    detected, _ = self.floor_detected()
+                    if detected:
+                        lost = 0
                     else:
-                        self._gp_last_sep_px = (
-                            gp_sep_decay * self._gp_last_sep_px
-                            + (1.0 - gp_sep_decay) * sep
-                        )
-                    # Only commit to the approach (activate HOLD) once the gate
-                    # has been stably centred for enough consecutive frames.
-                    # A fleeting glimpse during the search sweep (stable < stable_needed)
-                    # must not launch a premature forward approach.
-                    if stable >= stable_needed:
-                        self._gp_last_seen_t = t_now
-                        self._gp_last_err_px = err_px
+                        lost += 1
 
-                # -------------------------------------------------------
-                # 2) Secondary near-stop heuristic (single post, big pixel count)
-                # -------------------------------------------------------
-                if not seen_both:
-                    seen_g = info.get("seen_g", False)
-                    seen_r = info.get("seen_r", False)
-                    n_g    = info.get("n_g", 0)
-                    n_r    = info.get("n_r", 0)
-                    one_post_big = (
-                        (seen_g and not seen_r and n_g >= gp_near_pixels) or
-                        (seen_r and not seen_g and n_r >= gp_near_pixels)
-                    )
-                    if one_post_big:
-                        log_info(
-                            f"[gp] Near-stop: single post pixel count "
-                            f"n_g={n_g} n_r={n_r} >= {gp_near_pixels}"
-                        )
+                    if lost >= lost_needed:
                         self.stop_base()
                         sim.wait(CFG["post_stop_settle_s"])
                         if CFG["edge_backoff_s"] > 0:
@@ -675,166 +643,254 @@ class YouBotPickController:
                             sim.wait(CFG["post_stop_settle_s"])
                         return
 
-                # -------------------------------------------------------
-                # 3) Not seen_both: HOLD or SEARCH
-                # -------------------------------------------------------
-                if not seen_both:
-                    # Flip scan direction occasionally when fully lost
-                    if (not info.get("seen_g")) and (not info.get("seen_r")):
-                        if (t_now - last_flip_t) > flip_every_s:
-                            scan_dir *= -1.0
-                            last_flip_t = t_now
+                    # --- Vision sensing ---
+                    seen_both, err_px, img_w, info = self.detect_goalposts()
 
-                    time_since_seen = t_now - self._gp_last_seen_t
+                    t_now = sim.getSimulationTime()
 
-                    if time_since_seen <= gp_lost_hold_s:
-                        # --- HOLD / TERMINAL APPROACH ---
+                    # -------------------------------------------------------
+                    # 1) Update "last seen" memory when both posts are visible
+                    # -------------------------------------------------------
+                    if seen_both:
+                        sep = info["sep"]
+                        if self._gp_last_sep_px is None:
+                            self._gp_last_sep_px = sep
+                        else:
+                            self._gp_last_sep_px = (
+                                gp_sep_decay * self._gp_last_sep_px
+                                + (1.0 - gp_sep_decay) * sep
+                            )
+                        # Only commit to the approach (activate HOLD) once the gate
+                        # has been stably centred for enough consecutive frames.
+                        # A fleeting glimpse during the search sweep (stable < stable_needed)
+                        # must not launch a premature forward approach.
+                        if stable >= stable_needed:
+                            self._gp_last_seen_t = t_now
+                            self._gp_last_err_px = err_px
+
+                    # -------------------------------------------------------
+                    # 2) Secondary near-stop heuristic (single post, big pixel count)
+                    # -------------------------------------------------------
+                    if not seen_both:
                         seen_g = info.get("seen_g", False)
                         seen_r = info.get("seen_r", False)
-                        cx_g   = info.get("cx_g")
-                        cx_r   = info.get("cx_r")
-
-                        half_img_w = img_w / 2.0
-                        if self._gp_last_sep_px is not None:
-                            if seen_g and not seen_r and cx_g is not None:
-                                center_est = cx_g + self._gp_last_sep_px / 2.0
-                                err_est = center_est - half_img_w
-                            elif seen_r and not seen_g and cx_r is not None:
-                                center_est = cx_r - self._gp_last_sep_px / 2.0
-                                err_est = center_est - half_img_w
-                            else:
-                                err_est = self._gp_last_err_px
-                        else:
-                            err_est = self._gp_last_err_px
-
-                        err_norm = err_est / max(1.0, half_img_w)
-                        omega = clamp(
-                            CFG["gp_kp_omega"] * err_norm,
-                            -CFG["gp_max_omega"], CFG["gp_max_omega"]
+                        n_g    = info.get("n_g", 0)
+                        n_r    = info.get("n_r", 0)
+                        one_post_big = (
+                            (seen_g and not seen_r and n_g >= gp_near_pixels) or
+                            (seen_r and not seen_g and n_r >= gp_near_pixels)
                         )
-                        omega *= CFG["gp_omega_sign"]
-
-                        vx = CFG["vx_sign"] * gp_final_forward_speed
-
-                        ws = self.wheels_from_twist(vx, 0.0, omega)
-                        ws = [clamp(w, -wmax, wmax) for w in ws]
-                        for h, w in zip(self.wheels, ws):
-                            sim.setJointTargetVelocity(h, w)
-
-                        sim.wait(dt)
-                        continue
-
-                    else:
-                        # --- SEARCH (or transition to edge drive) ---
-                        # If we previously acquired both posts but have now lost them
-                        # beyond the hold window, we must be close to the gate.
-                        # Transition straight to drive_to_floor_edge() so the cube is
-                        # dropped correctly when the sensor passes over the edge.
-                        if self._gp_last_seen_t > 0:
+                        if one_post_big:
                             log_info(
-                                "[gp] Both posts lost beyond hold window (previously "
-                                "acquired) ? transitioning to drive_to_floor_edge"
+                                f"[gp] Near-stop: single post pixel count "
+                                f"n_g={n_g} n_r={n_r} >= {gp_near_pixels}"
                             )
                             self.stop_base()
                             sim.wait(CFG["post_stop_settle_s"])
-                            self.drive_to_floor_edge()
+                            if CFG["edge_backoff_s"] > 0:
+                                self._drive_for_duration(CFG["edge_backoff_speed"], CFG["edge_backoff_s"])
+                                sim.wait(CFG["post_stop_settle_s"])
                             return
 
-                        # Posts were never acquired ? keep spinning to find them
-                        stable = 0
-                        omega = abs(CFG["gp_search_omega"])
-
-                        # Alternate direction only when no posts at all
+                    # -------------------------------------------------------
+                    # 3) Not seen_both: HOLD or SEARCH
+                    # -------------------------------------------------------
+                    if not seen_both:
+                        # Flip scan direction occasionally when fully lost
                         if (not info.get("seen_g")) and (not info.get("seen_r")):
-                            omega *= scan_dir
+                            if (t_now - last_flip_t) > flip_every_s:
+                                scan_dir *= -1.0
+                                last_flip_t = t_now
 
-                        # Base rotation sign for scan
-                        omega *= CFG["omega_sign"]
+                        time_since_seen = t_now - self._gp_last_seen_t
 
-                        ws = self.wheels_from_twist(0.0, 0.0, omega)
-                        ws = [clamp(w, -wmax, wmax) for w in ws]
-                        for h, w in zip(self.wheels, ws):
-                            sim.setJointTargetVelocity(h, w)
+                        if time_since_seen <= gp_lost_hold_s:
+                            # --- HOLD / TERMINAL APPROACH ---
+                            seen_g = info.get("seen_g", False)
+                            seen_r = info.get("seen_r", False)
+                            cx_g   = info.get("cx_g")
+                            cx_r   = info.get("cx_r")
 
-                        sim.wait(dt)
-                        continue
+                            half_img_w = img_w / 2.0
+                            if self._gp_last_sep_px is not None:
+                                if seen_g and not seen_r and cx_g is not None:
+                                    center_est = cx_g + self._gp_last_sep_px / 2.0
+                                    err_est = center_est - half_img_w
+                                elif seen_r and not seen_g and cx_r is not None:
+                                    center_est = cx_r - self._gp_last_sep_px / 2.0
+                                    err_est = center_est - half_img_w
+                                else:
+                                    err_est = self._gp_last_err_px
+                            else:
+                                err_est = self._gp_last_err_px
 
-                # -------------------------------------------------------
-                # 4) seen_both: normal ALIGN + forward policy (Stage A)
-                # -------------------------------------------------------
+                            err_norm = err_est / max(1.0, half_img_w)
+                            omega = clamp(
+                                CFG["gp_kp_omega"] * err_norm,
+                                -CFG["gp_max_omega"], CFG["gp_max_omega"]
+                            )
+                            omega *= CFG["gp_omega_sign"]
 
-                # Stable-frame counter with decay
-                if abs(err_px) <= tol_px:
-                    stable = min(stable + 1, stable_needed)
-                else:
-                    stable = max(stable - 1, 0)
+                            vx = CFG["vx_sign"] * gp_final_forward_speed
 
-                # Closed-loop omega from pixel error
-                err_norm = err_px / max(1.0, img_w * 0.5)
-                omega = clamp(
-                    CFG["gp_kp_omega"] * err_norm,
-                    -CFG["gp_max_omega"], CFG["gp_max_omega"]
-                )
-                omega *= CFG["gp_omega_sign"]
+                            ws = self.wheels_from_twist(vx, 0.0, omega)
+                            ws = [clamp(w, -wmax, wmax) for w in ws]
+                            for h, w in zip(self.wheels, ws):
+                                sim.setJointTargetVelocity(h, w)
 
-                # Forward motion policy
-                drive_tol = CFG.get("gp_drive_tol_px", 3 * tol_px)
-                err_abs   = abs(err_px)
+                            sim.wait(dt)
+                            continue
 
-                if err_abs <= drive_tol:
-                    vx = CFG["vx_sign"] * (0.5 * CFG["gp_forward_speed"])  # creep
-                else:
-                    vx = 0.0
-
-                # Full speed when fully stable
-                if stable >= stable_needed and err_abs <= tol_px:
-                    vx = CFG["vx_sign"] * CFG["gp_forward_speed"]
-
-                ws = self.wheels_from_twist(vx, 0.0, omega)
-                ws = [clamp(w, -wmax, wmax) for w in ws]
-                for h, w in zip(self.wheels, ws):
-                    sim.setJointTargetVelocity(h, w)
-
-                # --- Step-forward phase ---
-                if stable >= stable_needed and err_abs <= tol_px:
-                    t_end = sim.getSimulationTime() + CFG["gp_step_time"]
-
-                    while not sim.getSimulationStopping() and sim.getSimulationTime() < t_end:
-                        # Edge check during step
-                        detected2, _ = self.floor_detected()
-                        if not detected2:
-                            lost += 1
-                            if lost >= lost_needed:
-                                break
                         else:
-                            lost = 0
+                            # --- SEARCH (or transition to edge drive) ---
+                            # If we previously acquired both posts but have now lost them
+                            # beyond the hold window, we must be close to the gate.
+                            if self._gp_last_seen_t > 0:
+                                # Early-trigger check: if the robot made too few forward
+                                # steps it was likely already very close when it first
+                                # spotted the posts and committed too soon.  Return home
+                                # and restart the visual search instead of driving blindly
+                                # to the edge.
+                                if step_count <= min_align_steps and _attempt < max_retries:
+                                    log_info(
+                                        f"[gp] Early trigger detected "
+                                        f"(step_count={step_count} <= {min_align_steps}, "
+                                        f"attempt {_attempt + 1}/{max_retries}): "
+                                        "returning home to retry search"
+                                    )
+                                    self.stop_base()
+                                    _early_trigger = True
+                                    break
 
-                        seen2, err_px2, img_w2, info2 = self.detect_goalposts()
-                        if not seen2:
-                            # Vision lost during step: stop and re-enter main loop
-                            break
+                                # Genuine approach: both posts lost beyond hold window.
+                                # Transition to drive_to_floor_edge so the cube is
+                                # dropped correctly when the sensor passes over the edge.
+                                log_info(
+                                    "[gp] Both posts lost beyond hold window (previously "
+                                    "acquired) \u2014 transitioning to drive_to_floor_edge"
+                                )
+                                self.stop_base()
+                                sim.wait(CFG["post_stop_settle_s"])
+                                self.drive_to_floor_edge()
+                                return
 
-                        err_norm2 = err_px2 / max(1.0, img_w2 * 0.5)
-                        omega2 = clamp(
-                            CFG["gp_kp_omega"] * err_norm2,
-                            -CFG["gp_max_omega"], CFG["gp_max_omega"]
-                        )
-                        omega2 *= CFG["gp_omega_sign"]
+                            # Posts were never acquired — keep spinning to find them
+                            stable = 0
+                            omega = abs(CFG["gp_search_omega"])
 
-                        ws2 = self.wheels_from_twist(
-                            CFG["vx_sign"] * CFG["gp_forward_speed"], 0.0, omega2
-                        )
-                        ws2 = [clamp(w, -wmax, wmax) for w in ws2]
-                        for hh, ww in zip(self.wheels, ws2):
-                            sim.setJointTargetVelocity(hh, ww)
+                            # Alternate direction only when no posts at all
+                            if (not info.get("seen_g")) and (not info.get("seen_r")):
+                                omega *= scan_dir
 
+                            # Base rotation sign for scan
+                            omega *= CFG["omega_sign"]
+
+                            ws = self.wheels_from_twist(0.0, 0.0, omega)
+                            ws = [clamp(w, -wmax, wmax) for w in ws]
+                            for h, w in zip(self.wheels, ws):
+                                sim.setJointTargetVelocity(h, w)
+
+                            sim.wait(dt)
+                            continue
+
+                    # -------------------------------------------------------
+                    # 4) seen_both: normal ALIGN + forward policy (Stage A)
+                    # -------------------------------------------------------
+
+                    # Stable-frame counter with decay
+                    if abs(err_px) <= tol_px:
+                        stable = min(stable + 1, stable_needed)
+                    else:
+                        stable = max(stable - 1, 0)
+
+                    # Closed-loop omega from pixel error
+                    err_norm = err_px / max(1.0, img_w * 0.5)
+                    omega = clamp(
+                        CFG["gp_kp_omega"] * err_norm,
+                        -CFG["gp_max_omega"], CFG["gp_max_omega"]
+                    )
+                    omega *= CFG["gp_omega_sign"]
+
+                    # Forward motion policy
+                    drive_tol = CFG.get("gp_drive_tol_px", 3 * tol_px)
+                    err_abs   = abs(err_px)
+
+                    if err_abs <= drive_tol:
+                        vx = CFG["vx_sign"] * (0.5 * CFG["gp_forward_speed"])  # creep
+                    else:
+                        vx = 0.0
+
+                    # Full speed when fully stable
+                    if stable >= stable_needed and err_abs <= tol_px:
+                        vx = CFG["vx_sign"] * CFG["gp_forward_speed"]
+
+                    ws = self.wheels_from_twist(vx, 0.0, omega)
+                    ws = [clamp(w, -wmax, wmax) for w in ws]
+                    for h, w in zip(self.wheels, ws):
+                        sim.setJointTargetVelocity(h, w)
+
+                    # --- Step-forward phase ---
+                    if stable >= stable_needed and err_abs <= tol_px:
+                        step_count += 1
+
+                        t_end = sim.getSimulationTime() + CFG["gp_step_time"]
+
+                        while not sim.getSimulationStopping() and sim.getSimulationTime() < t_end:
+                            # Edge check during step
+                            detected2, _ = self.floor_detected()
+                            if not detected2:
+                                lost += 1
+                                if lost >= lost_needed:
+                                    break
+                            else:
+                                lost = 0
+
+                            seen2, err_px2, img_w2, info2 = self.detect_goalposts()
+                            if not seen2:
+                                # Vision lost during step: stop and re-enter main loop
+                                break
+
+                            err_norm2 = err_px2 / max(1.0, img_w2 * 0.5)
+                            omega2 = clamp(
+                                CFG["gp_kp_omega"] * err_norm2,
+                                -CFG["gp_max_omega"], CFG["gp_max_omega"]
+                            )
+                            omega2 *= CFG["gp_omega_sign"]
+
+                            ws2 = self.wheels_from_twist(
+                                CFG["vx_sign"] * CFG["gp_forward_speed"], 0.0, omega2
+                            )
+                            ws2 = [clamp(w, -wmax, wmax) for w in ws2]
+                            for hh, ww in zip(self.wheels, ws2):
+                                sim.setJointTargetVelocity(hh, ww)
+
+                            sim.wait(dt)
+
+                        self.stop_base()
+                        sim.wait(CFG["post_stop_settle_s"])
+                        stable = 0
+                    else:
                         sim.wait(dt)
 
-                    self.stop_base()
-                    sim.wait(CFG["post_stop_settle_s"])
-                    stable = 0
+                # --- End of inner while loop ---
+                if _early_trigger:
+                    log_info(
+                        f"[gp] Returning to home position before retry "
+                        f"(attempt {_attempt + 1}/{max_retries})"
+                    )
+                    self.return_base_to_world_origin()
+                    # loop continues: next attempt restarts the visual search
                 else:
-                    sim.wait(dt)
+                    # Normal exit (edge found or sim stopping) — done
+                    return
+
+            # All retries exhausted without a clean edge-driven exit.
+            # Fall back to a direct edge drive so the cube is always dropped.
+            log_info(
+                f"[gp] Early-trigger retries exhausted ({max_retries}); "
+                "falling back to drive_to_floor_edge"
+            )
+            self.drive_to_floor_edge()
                     
     def drive_to_floor_edge(self):
         with StepLogger("Drive to floor edge"):
