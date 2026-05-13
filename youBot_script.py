@@ -767,7 +767,7 @@ class YouBotPickController:
                                 # dropped correctly when the sensor passes over the edge.
                                 log_info(
                                     "[gp] Both posts lost beyond hold window (previously "
-                                    "acquired) — transitioning to drive_to_floor_edge"
+                                    "acquired) \u2014 transitioning to drive_to_floor_edge"
                                 )
                                 self.stop_base()
                                 sim.wait(CFG["post_stop_settle_s"])
