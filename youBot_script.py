@@ -1017,7 +1017,7 @@ def sysCall_thread():
 
 
 def sysCall_cleanup():
-    if "ctrl" not in globals():
+    if not INIT_OK:
         return
     try:
         ctrl.stop_base()
