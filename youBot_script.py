@@ -320,6 +320,8 @@ class YouBotPickController:
         self._wrist_latched        = None
         self._arm_moved            = False
 
+        self.collected_cubes = []   # handles of cubes already picked up
+
         # Visual drop-zone navigation state (Stage B terminal approach)
         self._gp_last_seen_t  = -1.0   # sim time when both posts were last seen
         self._gp_last_err_px  = 0.0    # last known gate-centre pixel error
@@ -1209,6 +1211,16 @@ class YouBotPickController:
     def drop_cuboid_off_edge(self):
         with StepLogger("Drop cuboid off edge"):
             sim.wait(CFG["edge_drop_pause_s"])
+
+            # Restore dynamic properties so the cube falls under gravity after release
+            if self.attached_object is not None:
+                try:
+                    sim.setObjectInt32Param(self.attached_object, sim.shapeintparam_static, 0)
+                    sim.setObjectInt32Param(self.attached_object, sim.shapeintparam_respondable, 1)
+                    sim.resetDynamicObject(self.attached_object)
+                except Exception as e:
+                    log_info(f"  [drop_cuboid_off_edge] failed to restore dynamics: {e}")
+
             self.open_gripper()
             sim.wait(0.2)
             self._drive_for_duration(CFG["edge_reverse_speed"], CFG["edge_reverse_s"])
@@ -1368,19 +1380,50 @@ class YouBotPickController:
 
     def run_mission_loop(self):
         with StepLogger("MISSION LOOP"):
-            for path in CFG["pick_targets"]:
-                h = sim.getObject(path, {"noError": True})
-                if h == -1:
-                    log_info(f"[skip] missing {path}")
-                    continue
+            while True:
+                # Build list of uncollected, available cube handles
+                candidates = []
+                for path in CFG["pick_targets"]:
+                    h = sim.getObject(path, {"noError": True})
+                    if h == -1:
+                        log_info(f"[skip] missing {path}")
+                        continue
+                    if h in self.collected_cubes:
+                        continue
+                    candidates.append((path, h))
 
-                log_info(f"[mission] picking {path}")
+                if not candidates:
+                    log_info("[mission] all cubes collected or unavailable")
+                    break
+
+                # Pick the closest uncollected cube
+                best_path, best_h, best_dist = None, None, float('inf')
+                for path, h in candidates:
+                    rel  = sim.getObjectPosition(h, self.base_ref)
+                    dist = math.hypot(rel[0], rel[1])
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_path = path
+                        best_h    = h
+
+                log_info(f"[mission] picking closest: {best_path} dist={best_dist:.3f}m "
+                         f"(collected so far: {len(self.collected_cubes)})")
                 try:
-                    self.pick_and_drop_one(h)
+                    self.pick_and_drop_one(best_h)
+                    self.collected_cubes.append(best_h)
+                    aliases = []
+                    for c in self.collected_cubes:
+                        try:
+                            aliases.append(sim.getObjectAlias(c, 1))
+                        except Exception:
+                            aliases.append(str(c))
+                    log_info(f"[mission] collected {len(self.collected_cubes)} cube(s): {aliases}")
                 except Exception as e:
                     log_info(
-                        f"[mission] failed on {path}: {e}\n{traceback.format_exc()}"
+                        f"[mission] failed on {best_path}: {e}\n{traceback.format_exc()}"
                     )
+                    # Mark as attempted so we don't retry a broken cube indefinitely
+                    self.collected_cubes.append(best_h)
                     continue
 
 
