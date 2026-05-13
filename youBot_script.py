@@ -642,8 +642,8 @@ class YouBotPickController:
                 if not seen_both:
                     seen_g = info.get("seen_g", False)
                     seen_r = info.get("seen_r", False)
-                    n_g    = info.get("n_g", 0) or 0
-                    n_r    = info.get("n_r", 0) or 0
+                    n_g    = info.get("n_g", 0)
+                    n_r    = info.get("n_r", 0)
                     one_post_big = (
                         (seen_g and not seen_r and n_g >= gp_near_pixels) or
                         (seen_r and not seen_g and n_r >= gp_near_pixels)
@@ -679,19 +679,20 @@ class YouBotPickController:
                         cx_g   = info.get("cx_g")
                         cx_r   = info.get("cx_r")
 
+                        half_img_w = img_w / 2.0
                         if self._gp_last_sep_px is not None:
                             if seen_g and not seen_r and cx_g is not None:
                                 center_est = cx_g + self._gp_last_sep_px / 2.0
-                                err_est = center_est - img_w / 2.0
+                                err_est = center_est - half_img_w
                             elif seen_r and not seen_g and cx_r is not None:
                                 center_est = cx_r - self._gp_last_sep_px / 2.0
-                                err_est = center_est - img_w / 2.0
+                                err_est = center_est - half_img_w
                             else:
                                 err_est = self._gp_last_err_px
                         else:
                             err_est = self._gp_last_err_px
 
-                        err_norm = err_est / max(1.0, img_w * 0.5)
+                        err_norm = err_est / max(1.0, half_img_w)
                         omega = clamp(
                             CFG["gp_kp_omega"] * err_norm,
                             -CFG["gp_max_omega"], CFG["gp_max_omega"]
