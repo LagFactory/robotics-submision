@@ -154,7 +154,7 @@ CFG = {
     "gp_align_stable_steps": 2,     # stable frames required for "locked-on"
     "gp_search_omega": 0.25,        # rad/s spin when posts not visible
     "gp_timeout_s": 200,             # overall timeout
-    "gp_omega_sign": -1.0,  # -1.0 compensates for upside-down camera (mirrors image x-axis)
+    "gp_omega_sign": 1.0,   # flip to -1.0 if it steers away from the posts
     "gp_drive_tol_px": 40,
 
     # --- Terminal approach (Stage B) ---
@@ -653,10 +653,8 @@ class YouBotPickController:
 
                 # -------------------------------------------------------
                 # 2) Secondary near-stop heuristic (single post, big pixel count)
-                # Only active after both posts have been stably acquired at least
-                # once, so the initial search sweep always waits for both posts.
                 # -------------------------------------------------------
-                if not seen_both and self._gp_last_seen_t > 0:
+                if not seen_both:
                     seen_g = info.get("seen_g", False)
                     seen_r = info.get("seen_r", False)
                     n_g    = info.get("n_g", 0)
