@@ -126,6 +126,12 @@ CFG = {
     # --- Vision-guided drop zone (goalposts) ---
     "front_cam_path": ":/frontCam",  # if the vision sensor is parented under the youBot model
     # If not inside the model tree, use "/frontCam" instead.
+    
+    "gp_y0_frac": 0.0,
+    "gp_y1_frac": 1.0,
+    "gp_stride": 1,
+    "gp_min_pixels": 40,
+
 
     # Color thresholds in RGB (0..255) for PURE colored posts:
     "gp_green_min": [0, 180, 0],    # green: G high, R/B low
@@ -135,19 +141,21 @@ CFG = {
     "gp_red_max":   [255, 80, 80],
 
     # Minimum number of pixels required to accept detection:
-    "gp_min_pixels": 40,
+    
 
     # Visual servo control:
-    "gp_kp_omega": 1.2,             # turning gain from pixel error
-    "gp_max_omega": 0.7,            # rad/s command into wheels_from_twist
+    "gp_kp_omega": 0.6,             # turning gain from pixel error
+    "gp_max_omega": 0.35,            # rad/s command into wheels_from_twist
 
     # Step-drive behaviour:
     "gp_forward_speed": 0.10,       # m/s forward when aligned
     "gp_step_time": 0.25,           # seconds per forward step
-    "gp_align_tol_px": 10,          # must centre gate within this pixel tolerance
-    "gp_align_stable_steps": 6,     # stable frames required for "locked-on"
-    "gp_search_omega": 0.35,        # rad/s spin when posts not visible
-    "gp_timeout_s": 60,             # overall timeout
+    "gp_align_tol_px": 16,          # must centre gate within this pixel tolerance
+    "gp_align_stable_steps": 2,     # stable frames required for "locked-on"
+    "gp_search_omega": 0.25,        # rad/s spin when posts not visible
+    "gp_timeout_s": 200,             # overall timeout
+    "gp_omega_sign": 1.0,   # flip to -1.0 if it steers away from the posts
+    "gp_drive_tol_px": 40,
 
 }
 
@@ -598,28 +606,22 @@ class YouBotPickController:
                 if not seen_both and (sim.getSimulationTime() - last_flip_t) > flip_every_s:
                     scan_dir *= -1.0
                     last_flip_t = sim.getSimulationTime()
-
+                                        
+                
                 if not seen_both:
                     stable = 0
 
-                    # SEARCH / ACQUIRE
-                    omega = CFG["gp_search_omega"]
+                    # Spin to acquire both posts:
+                    omega = abs(CFG["gp_search_omega"])
 
-                    if info.get("seen_g") and not info.get("seen_r"):
-                        cx = info.get("cx_g")
-                        if cx is not None:
-                            omega = -abs(omega) if cx < img_w * 0.5 else abs(omega)
+                    # Alternate scan direction only if we see nothing at all:
+                    if (not info.get("seen_g")) and (not info.get("seen_r")):
+                        omega *= scan_dir
 
-                    elif info.get("seen_r") and not info.get("seen_g"):
-                        cx = info.get("cx_r")
-                        if cx is not None:
-                            omega = -abs(omega) if cx < img_w * 0.5 else abs(omega)
+                    # Use base rotation sign for scan:
+                    omega *= CFG["omega_sign"]
 
-                    else:
-                        omega = abs(omega)
-
-                    omega *= CFG["omega_sign"] * scan_dir
-
+                    # ACTUATE + WAIT + CONTINUE  ?
                     ws = self.wheels_from_twist(0.0, 0.0, omega)
                     ws = [clamp(w, -wmax, wmax) for w in ws]
                     for h, w in zip(self.wheels, ws):
@@ -628,19 +630,39 @@ class YouBotPickController:
                     sim.wait(dt)
                     continue
 
+
+
                 # --- ALIGN logic (stable frames) ---
+                
                 if abs(err_px) <= tol_px:
-                    stable += 1
+                    stable = min(stable + 1, stable_needed)
                 else:
-                    stable = 0
+                    stable = max(stable - 1, 0)   # decay instead of reset
+
 
                 # Closed-loop omega from pixel error
                 err_norm = err_px / max(1.0, img_w * 0.5)
                 omega = clamp(CFG["gp_kp_omega"] * err_norm, -CFG["gp_max_omega"], CFG["gp_max_omega"])
-                omega *= CFG["omega_sign"]
+                omega *= CFG["gp_omega_sign"]
 
                 # Hold position until stable lock, then do a short forward step
-                vx = 0.0 if stable < stable_needed else (CFG["vx_sign"] * CFG["gp_forward_speed"])
+                
+                #--- Forward motion policy ---
+                # If error is small-ish, creep forward; if very small and stable, go full speed.
+                drive_tol = CFG.get("gp_drive_tol_px", 3 * tol_px)
+                err_abs = abs(err_px)
+
+                
+                if err_abs <= drive_tol:
+                    vx = CFG["vx_sign"] * (0.5 * CFG["gp_forward_speed"])  # creep
+                else:
+                    vx = 0.0
+
+
+                # if fully stable, allow full step speed
+                if stable >= stable_needed and err_abs <= tol_px:
+                    vx = CFG["vx_sign"] * CFG["gp_forward_speed"]
+
 
                 # Apply immediate command (mostly for align-in-place)
                 ws = self.wheels_from_twist(vx, 0.0, omega)
@@ -669,7 +691,7 @@ class YouBotPickController:
 
                         err_norm2 = err_px2 / max(1.0, img_w2 * 0.5)
                         omega2 = clamp(CFG["gp_kp_omega"] * err_norm2, -CFG["gp_max_omega"], CFG["gp_max_omega"])
-                        omega2 *= CFG["omega_sign"]
+                        omega2 *= CFG["gp_omega_sign"]
 
                         ws2 = self.wheels_from_twist(CFG["vx_sign"] * CFG["gp_forward_speed"], 0.0, omega2)
                         ws2 = [clamp(w, -wmax, wmax) for w in ws2]
@@ -782,4 +804,507 @@ class YouBotPickController:
             else:
                 stall = 0
 
-     
+            last = cur
+            sim.setJointTargetPosition(joint, cur + clamp(err, -step, step))
+            sim.wait(dt)
+
+        sim.setJointTargetPosition(joint, target)
+
+    def move_arm_sequential(self, target_config, order=(0, 1, 2, 3, 4),
+                            label="Move arm sequential", speed=None):
+        with StepLogger(label):
+            for idx in order:
+                self.move_joint_smooth(
+                    self.arm[idx], target_config[idx],
+                    speed=speed, joint_name=f"arm[{idx}]"
+                )
+            sim.wait(CFG["post_arm_settle_s"])
+
+    def move_arm_interpolated(self, target_config, joints=(1, 2, 3),
+                              duration=1.0, dt=0.02, label="Move arm interpolated"):
+        with StepLogger(label):
+            start = {i: sim.getJointPosition(self.arm[i]) for i in joints}
+            t0    = sim.getSimulationTime()
+
+            while not sim.getSimulationStopping():
+                t     = sim.getSimulationTime() - t0
+                alpha = min(1.0, t / max(1e-6, duration))
+
+                for i in joints:
+                    qi = start[i] + alpha * (target_config[i] - start[i])
+                    sim.setJointTargetPosition(self.arm[i], qi)
+
+                if alpha >= 1.0:
+                    break
+
+                sim.wait(dt)
+
+            for i in joints:
+                sim.setJointTargetPosition(self.arm[i], target_config[i])
+            sim.wait(CFG["post_arm_settle_s"])
+
+    # -------------------------------------------------------------------------
+    # Wrist computation
+    # -------------------------------------------------------------------------
+
+    def compute_wrist_for_target(self, target_handle):
+        """Compute wrist joint angle to align gripper with target's horizontal axis.
+
+        The result is latched in self._wrist_latched for the duration of one pick.
+        Reset self._wrist_latched = None before each pick to force recomputation.
+        """
+        if self._wrist_latched is not None:
+            return self._wrist_latched
+
+        cyclic, interval = sim.getJointInterval(self.arm[4])
+        if cyclic:
+            jmin, jmax = -math.pi, math.pi
+        else:
+            jmin = interval[0]
+            jmax = interval[0] + interval[1]
+
+        sens_pose  = sim.getObjectPose(self.wrist_sensor, sim.handle_world)
+        cube_pose  = sim.getObjectPose(target_handle,     sim.handle_world)
+
+        sens_dir   = _proj_xy_unit(_axis_world_from_pose(sens_pose, 0))
+        cube_dir_x = _proj_xy_unit(_axis_world_from_pose(cube_pose, 0))
+        cube_dir_y = _proj_xy_unit(_axis_world_from_pose(cube_pose, 1))
+
+        delta_candidates = [
+            _signed_angle_2d(sens_dir, cube_dir_x),
+            _signed_angle_2d(sens_dir, cube_dir_y),
+        ]
+
+        # Also consider 180? flips (axis alignment is bidirectional)
+        expanded = []
+        for d in delta_candidates:
+            expanded.append(_wrap_pi(d))
+            expanded.append(_wrap_pi(d + math.pi))
+            expanded.append(_wrap_pi(d - math.pi))
+
+        cur  = sim.getJointPosition(self.arm[4])
+        best = None
+        for d in expanded:
+            desired = _wrap_pi(cur + d)
+            if desired < jmin:
+                score, desired = 10.0 + (jmin - desired), jmin
+            elif desired > jmax:
+                score, desired = 10.0 + (desired - jmax), jmax
+            else:
+                score = abs(d)
+
+            if best is None or score < best[0]:
+                best = (score, desired)
+
+        desired = best[1]
+
+        if desired <= jmin + 1e-3 or desired >= jmax - 1e-3:
+            log_info(
+                f"[wrist] Hit wrist limit. desired={math.degrees(desired):.1f}deg "
+                f"limits=[{math.degrees(jmin):.1f},{math.degrees(jmax):.1f}]deg. "
+                f"Consider rotating base/joint0 for this cuboid yaw."
+            )
+
+        self._wrist_latched = desired
+        return desired
+
+    # -------------------------------------------------------------------------
+    # Arm actions
+    # -------------------------------------------------------------------------
+
+    def go_pregrip(self, target_handle):
+        with StepLogger("Go to pregrip (hover): joints 0->1->2->3, then wrist align"):
+            pose = POSES["pregrip"]
+
+            # Phase A: move joints 0..3 only (keep wrist as-is)
+            current_wrist = sim.getJointPosition(self.arm[4])
+            cfg = deg_pose_to_rad(pose["joints_deg"], wrist_rad=current_wrist)
+            log_info(
+                "  pregrip target (rad) [no wrist]: " +
+                ", ".join([f"{v:.3f}" for v in cfg])
+            )
+            self.move_arm_sequential(
+                cfg, order=pose["order"],
+                label="Arm to pregrip (0-3 only)", speed=CFG["arm_speed_pregrip"]
+            )
+
+            # Phase B: compute wrist at pregrip pose, then move wrist only
+            self._wrist_latched = None
+            wrist = self.compute_wrist_for_target(target_handle)
+            log_info(f"  wrist target (rad): {wrist:.3f}")
+            self.move_joint_smooth(self.arm[4], wrist, speed=CFG["arm_speed_pregrip"])
+
+    def go_grip_ready(self, target_handle):
+        with StepLogger("Go to grip-ready (descend) interpolated"):
+            pose  = POSES["grip_ready"]
+            wrist = self.compute_wrist_for_target(target_handle)
+            cfg   = deg_pose_to_rad(pose["joints_deg"], wrist_rad=wrist)
+            self.move_arm_interpolated(
+                cfg,
+                joints=pose["order"],
+                duration=CFG["grip_ready_duration_s"],
+                dt=CFG["grip_ready_dt"],
+                label=f"Grip-ready interpolated joints={pose['order']}"
+            )
+
+    def return_arm_to_neutral(self):
+        with StepLogger("Return arm to neutral/carry"):
+            pose  = POSES["neutral"]
+            wrist = deg2rad(pose["wrist_deg"])
+            cfg   = deg_pose_to_rad(pose["joints_deg"], wrist_rad=wrist)
+            self.move_arm_sequential(cfg, order=pose["order"], label="Arm to neutral/carry sequential")
+
+    def go_tucked_pose(self):
+        with StepLogger("Go to tucked pose"):
+            pose  = POSES["tucked"]
+            wrist = deg2rad(pose["wrist_deg"])
+            cfg   = deg_pose_to_rad(pose["joints_deg"], wrist_rad=wrist)
+            self.move_arm_sequential(cfg, order=pose["order"], label="Arm to tucked sequential")
+
+    # -------------------------------------------------------------------------
+    # Gripper
+    # -------------------------------------------------------------------------
+
+    def get_gripper_positions(self):
+        return sim.getJointPosition(self.gripper[0]), sim.getJointPosition(self.gripper[1])
+
+    def set_gripper_targets(self, j1, j2):
+        sim.setJointTargetPosition(self.gripper[0], j1)
+        sim.setJointTargetPosition(self.gripper[1], j2)
+
+    def is_grip_confirmed(self):
+        j1, j2 = self.get_gripper_positions()
+        tol    = CFG["gripper_tol"]
+        ok1    = j1 <= CFG["gripper_close_goal_j1"] + tol
+        ok2    = j2 >= CFG["gripper_close_goal_j2"] - tol
+        return ok1 and ok2
+
+    def step_close_gripper_symmetric(self):
+        j1, j2  = self.get_gripper_positions()
+        j1_goal = CFG["gripper_close_goal_j1"]
+        j2_goal = CFG["gripper_close_goal_j2"]
+        j1_next = j1_goal if j1 <= j1_goal else max(j1_goal, j1 + CFG["gripper_step_j1"])
+        j2_next = j2_goal if j2 >= j2_goal else min(j2_goal, j2 + CFG["gripper_step_j2"])
+        self.set_gripper_targets(j1_next, j2_next)
+
+    def open_gripper(self):
+        with StepLogger("Open gripper"):
+            self.detach_object_from_grip()
+            self.set_gripper_targets(CFG["gripper_open_j1"], CFG["gripper_open_j2"])
+            sim.wait(0.3)
+
+    def close_gripper_until_confirmed(self, target_handle):
+        with StepLogger("Close gripper slowly until confirmed (symmetric screw-joint closure)"):
+            t_start   = sim.getSimulationTime()
+            timeout   = CFG["gripper_close_timeout"]
+            log_every = CFG["log_every_steps"]
+            k         = 0
+
+            while not sim.getSimulationStopping():
+                if sim.getSimulationTime() - t_start > timeout:
+                    j1, j2 = self.get_gripper_positions()
+                    raise RuntimeError(
+                        f"Gripper close timeout. Current j1={j1:.4f}, j2={j2:.4f} "
+                        f"(goals: j1={CFG['gripper_close_goal_j1']:.4f}, "
+                        f"j2={CFG['gripper_close_goal_j2']:.4f})"
+                    )
+
+                if self.is_grip_confirmed():
+                    j1, j2 = self.get_gripper_positions()
+                    log_info(f"  grip confirmed at j1={j1:.4f}, j2={j2:.4f}")
+                    self.attach_object_to_grip(target_handle)
+                    log_info("  attached object to gripAttach")
+                    return
+
+                self.step_close_gripper_symmetric()
+
+                if k % log_every == 0:
+                    j1, j2 = self.get_gripper_positions()
+                    log_info(f"  closing... j1={j1:.4f}  j2={j2:.4f}")
+                k += 1
+
+                sim.wait(CFG["gripper_close_dt"])
+
+    # -------------------------------------------------------------------------
+    # Object attachment
+    # -------------------------------------------------------------------------
+
+    def attach_object_to_grip(self, obj_handle):
+        if obj_handle is None or obj_handle == -1:
+            raise RuntimeError("attach_object_to_grip: invalid handle")
+
+        self._attached_prev_parent = sim.getObjectParent(obj_handle)
+
+        # Capture current static flag so it can be restored accurately on detach
+        try:
+            self._attached_prev_static = sim.getObjectInt32Param(
+                obj_handle, sim.shapeintparam_static
+            )
+        except Exception:
+            self._attached_prev_static = 0
+
+        sim.setObjectParent(obj_handle, self.grip_attach, True)
+
+        try:
+            sim.setObjectInt32Param(obj_handle, sim.shapeintparam_static, 1)       # freeze while carried
+            sim.setObjectInt32Param(obj_handle, sim.shapeintparam_respondable, 0)  # reduce jitter
+        except Exception:
+            pass
+
+        try:
+            sim.resetDynamicObject(obj_handle)
+        except Exception:
+            pass
+
+        self.attached_object = obj_handle
+
+    def detach_object_from_grip(self):
+        if self.attached_object is None:
+            return
+
+        obj    = self.attached_object
+        parent = self._attached_prev_parent if self._attached_prev_parent is not None else -1
+        sim.setObjectParent(obj, parent, True)
+
+        try:
+            # Restore the original static flag captured at attach time
+            prev_static = self._attached_prev_static if self._attached_prev_static is not None else 0
+            sim.setObjectInt32Param(obj, sim.shapeintparam_static, prev_static)
+            sim.setObjectInt32Param(obj, sim.shapeintparam_respondable, 1)
+        except Exception:
+            pass
+
+        try:
+            sim.resetDynamicObject(obj)
+        except Exception:
+            pass
+
+        self.attached_object       = None
+        self._attached_prev_parent = None
+        self._attached_prev_static = None
+
+    # -------------------------------------------------------------------------
+    # Drop sequence
+    # -------------------------------------------------------------------------
+
+    def drop_cuboid_off_edge(self):
+        with StepLogger("Drop cuboid off edge"):
+            sim.wait(CFG["edge_drop_pause_s"])
+            self.open_gripper()
+            sim.wait(0.2)
+            self._drive_for_duration(CFG["edge_reverse_speed"], CFG["edge_reverse_s"])
+            
+            
+    #---------------------------------------------------
+    #Cam stuff
+    #----------------------------------------------
+    
+    def get_front_cam_rgb(self):
+            """
+            Returns (rgb_list, w, h) where rgb_list is a flat [R,G,B,R,G,B,...] list.
+            Requires the sensor to have been handled this step.
+            """
+            # If frontCam has explicit handling enabled, we MUST handle it ourselves:
+            sim.handleVisionSensor(self.front_cam)  # ensures fresh image [3](https://manual.coppeliarobotics.com/en/sim/simGetVisionSensorImg.htm)[2](https://github.com/CoppeliaRobotics/manual/blob/master/en/textureDialog.htm)
+
+            img_bytes, res = sim.getVisionSensorImg(self.front_cam)  # bytes + [w,h] [3](https://manual.coppeliarobotics.com/en/sim/simGetVisionSensorImg.htm)
+            w, h = res[0], res[1]
+
+            # Convert bytes -> list of ints (0..255)
+            rgb = sim.unpackUInt8Table(img_bytes)  # recommended by docs [3](https://manual.coppeliarobotics.com/en/sim/simGetVisionSensorImg.htm)
+            return rgb, w, h
+            
+    
+    def _centroid_rgb_threshold(self, rgb, w, h, mn, mx):
+        """
+        Fast centroid of pixels within RGB box [mn,mx], scanning only a vertical band
+        and skipping pixels by 'gp_stride' for speed.
+        Returns (cx, count).
+        """
+        rmin, gmin, bmin = mn
+        rmax, gmax, bmax = mx
+
+        stride = CFG.get("gp_stride", 1)
+
+        # Compute y-band limits HERE (inside the function)
+        y0 = int(h * CFG.get("gp_y0_frac", 0.0))
+        y1 = int(h * CFG.get("gp_y1_frac", 1.0))
+
+        # Clamp to valid range
+        y0 = max(0, min(h, y0))
+        y1 = max(0, min(h, y1))
+        if y1 <= y0:
+            y0, y1 = 0, h  # fallback
+
+        count = 0
+        xsum = 0
+
+        for y in range(y0, y1, stride):
+            row_base = (y * w) * 3
+            for x in range(0, w, stride):
+                idx = row_base + x * 3
+                r = rgb[idx]
+                g = rgb[idx + 1]
+                b = rgb[idx + 2]
+
+                if (rmin <= r <= rmax) and (gmin <= g <= gmax) and (bmin <= b <= bmax):
+                    count += 1
+                    xsum += x
+
+        if count == 0:
+            return None, 0
+
+        return xsum / count, count
+
+
+        
+    
+    
+    def detect_goalposts(self):
+        """
+        Returns:
+          seen_both (bool),
+          err_px (float)      = (center_x - w/2) if both seen else 0
+          w (int)
+          info (dict): includes seen_g, seen_r, cx_g, cx_r, counts
+        """
+        rgb, w, h = self.get_front_cam_rgb()
+
+        cx_g, n_g = self._centroid_rgb_threshold(rgb, w, h, CFG["gp_green_min"], CFG["gp_green_max"])
+        cx_r, n_r = self._centroid_rgb_threshold(rgb, w, h, CFG["gp_red_min"],   CFG["gp_red_max"])
+        
+        minpix = CFG["gp_min_pixels"]
+        seen_g = (cx_g is not None) and (n_g >= minpix)
+        seen_r = (cx_r is not None) and (n_r >= minpix)
+        if int(sim.getSimulationTime() / CFG["dt"]) % 10 == 0:
+            log_info(
+                f"[gp] n_g={n_g} n_r={n_r} seen_g={seen_g} seen_r={seen_r} "
+                f"cx_g={cx_g} cx_r={cx_r} w={w} err={(0.5*(cx_g+cx_r)-w*0.5) if (seen_g and seen_r) else None}"
+            )
+
+        if not (seen_g and seen_r):
+            return False, 0.0, w, {"seen_g": seen_g, "seen_r": seen_r, "cx_g": cx_g, "cx_r": cx_r, "n_g": n_g, "n_r": n_r}
+
+        center = 0.5 * (cx_g + cx_r)
+        err_px = center - (w * 0.5)
+        return True, err_px, w, {"seen_g": True, "seen_r": True, "cx_g": cx_g, "cx_r": cx_r, "n_g": n_g, "n_r": n_r}
+
+
+    
+
+    # -------------------------------------------------------------------------
+    # Mission
+    # -------------------------------------------------------------------------
+
+    def pause_step(self, seconds, label):
+        with StepLogger(label):
+            sim.wait(seconds)
+
+    def pick_and_drop_one(self, target_handle):
+        """Execute a full pick-carry-drop-return cycle for one target object."""
+        self._arm_moved = False
+        with StepLogger("FULL PICK SEQUENCE"):
+            try:
+                self._wrist_latched = None
+                self.turn_to_face_target(target_handle, label="Face cuboid")
+                self.drive_to_stop(
+                    target_handle, CFG["stop_distance"],
+                    use_clearance=True, label="Drive to cuboid"
+                )
+
+                self._arm_moved = True
+                self.go_pregrip(target_handle)
+                self.pause_step(CFG["pregrip_pause_s"], "Pause at pregrip")
+                self.go_grip_ready(target_handle)
+                self.close_gripper_until_confirmed(target_handle)
+
+                self._arm_moved = False   # arm back to neutral after this point
+                self.return_arm_to_neutral()
+                self.drive_to_dropzone_visual()
+                self.drop_cuboid_off_edge()
+
+                self.go_tucked_pose()
+                self.return_base_to_world_origin()
+
+            finally:
+                # Safety cleanup: ensure wheels stop and object is released
+                self.stop_base()
+                self.detach_object_from_grip()
+                # If the arm was extended when an exception occurred, tuck it safely
+                if self._arm_moved:
+                    try:
+                        self.go_tucked_pose()
+                    except Exception:
+                        pass
+
+    def run_mission_loop(self):
+        with StepLogger("MISSION LOOP"):
+            for path in CFG["pick_targets"]:
+                h = sim.getObject(path, {"noError": True})
+                if h == -1:
+                    log_info(f"[skip] missing {path}")
+                    continue
+
+                log_info(f"[mission] picking {path}")
+                try:
+                    self.pick_and_drop_one(h)
+                except Exception as e:
+                    log_info(
+                        f"[mission] failed on {path}: {e}\n{traceback.format_exc()}"
+                    )
+                    continue
+
+
+# -----------------------------------------------------------------------
+# DEBUG UTILITIES ? not called during normal mission; kept for manual use
+# -----------------------------------------------------------------------
+
+def _debug_reset_robot_to_world_origin(ctrl):
+    """Teleport the robot model to world origin. For debugging / manual recovery only."""
+    with StepLogger("Reset robot to world origin (0,0)"):
+        ctrl.stop_base()
+        p  = sim.getObjectPosition(ctrl.model, sim.handle_world)
+        z  = p[2]
+        x0, y0 = CFG.get("reset_base_xy", [0.0, 0.0])
+        pose = [x0, y0, z, 0.0, 0.0, 0.0, 1.0]
+        sim.setObjectPose(ctrl.model, pose, sim.handle_world)
+        ctrl.stop_base()
+        sim.wait(0.05)
+
+
+# -----------------------------
+# CoppeliaSim entry points
+# -----------------------------
+def sysCall_init():
+    global sim, ctrl, INIT_OK
+    sim    = require("sim")
+    INIT_OK = False
+    ctrl   = YouBotPickController()
+    try:
+        ctrl.init_handles()
+        INIT_OK = True
+    except Exception as e:
+        log_info(f"[FATAL] Init failed: {e}\n{traceback.format_exc()}")
+        try:
+            sim.addLog(sim.verbosity_errors, f"[FATAL] Init failed: {e}")
+        except Exception:
+            pass
+
+
+def sysCall_thread():
+    # Threaded scripts can safely block/yield with sim.wait
+    if not INIT_OK:
+        log_info("[ABORT] Init failed; not running sequence.")
+        return
+
+    sim.wait(0.2)
+    ctrl.run_mission_loop()
+
+
+def sysCall_cleanup():
+    if not INIT_OK:
+        return
+    try:
+        ctrl.stop_base()
+    except Exception:
+        pass
