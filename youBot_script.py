@@ -724,14 +724,14 @@ class YouBotPickController:
                         if self._gp_last_seen_t > 0:
                             log_info(
                                 "[gp] Both posts lost beyond hold window (previously "
-                                "acquired) → transitioning to drive_to_floor_edge"
+                                "acquired) ? transitioning to drive_to_floor_edge"
                             )
                             self.stop_base()
                             sim.wait(CFG["post_stop_settle_s"])
                             self.drive_to_floor_edge()
                             return
 
-                        # Posts were never acquired → keep spinning to find them
+                        # Posts were never acquired ? keep spinning to find them
                         stable = 0
                         omega = abs(CFG["gp_search_omega"])
 
@@ -826,6 +826,7 @@ class YouBotPickController:
                     stable = 0
                 else:
                     sim.wait(dt)
+                    
     def drive_to_floor_edge(self):
         with StepLogger("Drive to floor edge"):
             dt          = CFG["dt"]
@@ -1349,8 +1350,8 @@ class YouBotPickController:
                 self._arm_moved = False   # arm back to neutral after this point
                 self.return_arm_to_neutral()
                 self.drive_to_dropzone_visual()
+                self.drive_to_floor_edge()
                 self.drop_cuboid_off_edge()
-
                 self.go_tucked_pose()
                 self.return_base_to_world_origin()
 
