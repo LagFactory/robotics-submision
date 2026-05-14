@@ -295,6 +295,7 @@ The robot uses a forward-facing RGB vision sensor (`frontCam`) to locate a pair 
 |-----|---------|-------------|
 | `gp_min_approach_s` | `2.0 s` | Minimum simulation time (seconds) that must elapse from the start of a visual approach attempt before a floor-edge transition is treated as genuine; if elapsed < this value the approach is considered an early trigger and the robot returns home to retry |
 | `gp_early_trigger_max_retries` | `3` | Maximum number of early-trigger retries before falling back to `drive_to_floor_edge` directly |
+| `gp_min_sep_frac` | `0.25` | Minimum inter-post separation required for an approach to be considered valid, expressed as a fraction of the camera image width. If the two posts are closer together than this fraction (e.g. the robot is viewing the gate from a steep side-angle), any attempt to commit to the edge drive is treated as an early trigger and the robot returns home to retry. The separation is measured as the horizontal pixel distance between the green-post centroid and the red-post centroid. Increase to demand a more head-on approach; decrease if the robot unnecessarily retries from a valid but slightly off-angle position. |
 
 ### Miscellaneous
 
@@ -495,7 +496,7 @@ Camera-guided approach to the drop-off area using the two coloured goal posts as
 - Triggered when the posts grow very large (`gp_near_pixels`) or both posts disappear after the robot was previously aligned. The robot continues forward at `gp_final_forward_speed` for up to `gp_lost_hold_s` seconds, relying on the edge sensor for the final stop.
 
 *Early-trigger retry:*
-- If the edge is reached before `gp_min_approach_s` seconds have elapsed since the start of the current attempt (robot started too close to the posts), the approach is considered a false trigger. The robot stops and returns home, then restarts the visual search. Up to `gp_early_trigger_max_retries` retries are attempted; if all retries are exhausted, `drive_to_floor_edge()` is called directly as a fallback.
+- Any attempt to commit to the edge drive (floor-edge sensor confirmation, near-stop heuristic, or hold-timeout transition) is gated on two conditions: (1) the elapsed approach time must exceed `gp_min_approach_s`, **and** (2) both goal posts must have been seen simultaneously with a horizontal separation of at least `gp_min_sep_frac × image_width` pixels (ensuring the robot was approaching from roughly in front of the gate, not from a steep side-angle). If either condition is not met and retries remain, the robot stops and calls `return_base_to_world_origin()` before restarting the visual search. Up to `gp_early_trigger_max_retries` retries are attempted; if all retries are exhausted, `drive_to_floor_edge()` is called directly as a fallback.
 
 **`return_base_to_world_origin()`**
 Convenience sequencer: calls `turn_to_face_target` then `drive_to_stop` targeting the `home_dummy` at (0,0,0).
