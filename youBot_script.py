@@ -690,6 +690,18 @@ class YouBotPickController:
                             (seen_r and not seen_g and n_r >= gp_near_pixels)
                         )
                         if one_post_big:
+                            elapsed = sim.getSimulationTime() - t0
+                            if elapsed < min_approach_s and _attempt < max_retries:
+                                log_info(
+                                    f"[gp] Near-stop early trigger: single post pixel count "
+                                    f"n_g={n_g} n_r={n_r} >= {gp_near_pixels} but only "
+                                    f"{elapsed:.2f}s elapsed (< {min_approach_s}s, "
+                                    f"attempt {_attempt + 1}/{max_retries}): "
+                                    "returning home to retry search"
+                                )
+                                self.stop_base()
+                                _early_trigger = True
+                                break
                             log_info(
                                 f"[gp] Near-stop: single post pixel count "
                                 f"n_g={n_g} n_r={n_r} >= {gp_near_pixels}"
