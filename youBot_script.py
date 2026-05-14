@@ -165,11 +165,12 @@ CFG = {
 
     # --- Early-trigger retry ---
     # If the robot sees the goalposts and immediately commits to drive_to_floor_edge
-    # after only a small number of forward-step phases (e.g. started too close),
+    # before enough sim time has elapsed (e.g. started too close to the gate),
     # it returns home and restarts the visual search instead.
-    "gp_min_align_steps": 2,          # minimum step-forward phases before a floor-edge
-                                       # transition is considered a genuine approach
-                                       # (if step_count <= this, it's an early trigger)
+    "gp_min_approach_s": 2.0,          # minimum sim-seconds that must elapse from the
+                                        # start of an attempt before a floor-edge
+                                        # transition is considered a genuine approach
+                                        # (if elapsed < this, it's an early trigger)
     "gp_early_trigger_max_retries": 3, # how many times to retry after an early trigger
 
 }
@@ -601,8 +602,8 @@ class YouBotPickController:
             gp_sep_decay           = CFG["gp_sep_decay"]
 
             # Early-trigger retry settings
-            min_align_steps = CFG["gp_min_align_steps"]
-            max_retries     = CFG["gp_early_trigger_max_retries"]
+            min_approach_s = CFG["gp_min_approach_s"]
+            max_retries    = CFG["gp_early_trigger_max_retries"]
 
             for _attempt in range(max_retries + 1):
                 t0          = sim.getSimulationTime()
@@ -611,10 +612,6 @@ class YouBotPickController:
                 scan_dir    = 1.0
                 last_flip_t = t0
                 flip_every_s = (2.0 * math.pi) / max(0.05, abs(CFG["gp_search_omega"]))
-
-                # step_count tracks how many forward-step phases have been completed
-                # during this attempt; used to detect premature (early-trigger) exits.
-                step_count = 0
 
                 # Reset per-approach state so stale data from a previous cube cycle
                 # cannot trigger a premature edge-drive transition.
@@ -746,15 +743,16 @@ class YouBotPickController:
                             # If we previously acquired both posts but have now lost them
                             # beyond the hold window, we must be close to the gate.
                             if self._gp_last_seen_t > 0:
-                                # Early-trigger check: if the robot made too few forward
-                                # steps it was likely already very close when it first
-                                # spotted the posts and committed too soon.  Return home
-                                # and restart the visual search instead of driving blindly
-                                # to the edge.
-                                if step_count <= min_align_steps and _attempt < max_retries:
+                                # Early-trigger check: if not enough sim time has passed
+                                # since the start of this attempt, the robot was likely
+                                # already very close when it first spotted the posts and
+                                # committed too soon.  Return home and restart the visual
+                                # search instead of driving blindly to the edge.
+                                elapsed = t_now - t0
+                                if elapsed < min_approach_s and _attempt < max_retries:
                                     log_info(
                                         f"[gp] Early trigger detected "
-                                        f"(step_count={step_count} <= {min_align_steps}, "
+                                        f"(elapsed={elapsed:.2f}s < {min_approach_s}s, "
                                         f"attempt {_attempt + 1}/{max_retries}): "
                                         "returning home to retry search"
                                     )
@@ -831,8 +829,6 @@ class YouBotPickController:
 
                     # --- Step-forward phase ---
                     if stable >= stable_needed and err_abs <= tol_px:
-                        step_count += 1
-
                         t_end = sim.getSimulationTime() + CFG["gp_step_time"]
 
                         while not sim.getSimulationStopping() and sim.getSimulationTime() < t_end:
