@@ -633,6 +633,18 @@ class YouBotPickController:
                         lost += 1
 
                     if lost >= lost_needed:
+                        elapsed = sim.getSimulationTime() - t0
+                        if elapsed < min_approach_s and _attempt < max_retries:
+                            log_info(
+                                f"[gp] Edge reached but time gate not elapsed "
+                                f"(elapsed={elapsed:.2f}s < {min_approach_s}s, "
+                                f"attempt {_attempt + 1}/{max_retries}): "
+                                "triggering retry instead of committing to floor edge"
+                            )
+                            self.stop_base()
+                            _early_trigger = True
+                            break
+                        # Time gate elapsed or retries exhausted — commit to the edge.
                         self.stop_base()
                         sim.wait(CFG["post_stop_settle_s"])
                         if CFG["edge_backoff_s"] > 0:
