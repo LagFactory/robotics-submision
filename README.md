@@ -88,12 +88,13 @@ youBot_script.py
 │   ├── get_object_strict()      — robust path-based object lookup
 │   │
 │   ├── Geometry / Sensing
-│   │   ├── forward_lateral()    — decompose base-relative position
-│   │   ├── heading_error()      — angular error to target
-│   │   ├── get_clearance_to()   — proximity via checkDistance API
-│   │   ├── floor_detected()     — edge sensor proximity poll
-│   │   ├── get_front_cam_rgb()  — capture RGB image from frontCam
-│   │   └── detect_goalposts()   — colour-threshold goalpost detection
+│   │   ├── forward_lateral()        — decompose base-relative position
+│   │   ├── heading_error()          — angular error to target
+│   │   ├── get_clearance_to()       — proximity via checkDistance API
+│   │   ├── floor_detected()         — edge sensor proximity poll
+│   │   ├── get_front_cam_rgb()      — capture RGB image from frontCam
+│   │   ├── _centroid_rgb_threshold()— colour-threshold pixel centroid helper
+│   │   └── detect_goalposts()       — colour-threshold goalpost detection
 │   │
 │   ├── Base Movement — Primitives
 │   │   ├── wheels_from_twist()  — mecanum inverse kinematics
@@ -135,8 +136,8 @@ youBot_script.py
 │   │   └── drop_cuboid_off_edge()
 │   │
 │   └── Mission
-│       ├── pick_and_drop_one()    — full single-object cycle
-│       └── run_mission_loop()     — iterate over all pick targets
+│       ├── pick_and_drop_one()    — full single-object cycle (no home return)
+│       └── run_mission_loop()     — greedy closest-first iteration over pick targets
 │
 └── CoppeliaSim entry points
     ├── sysCall_init()
@@ -292,8 +293,8 @@ The robot uses a forward-facing RGB vision sensor (`frontCam`) to locate a pair 
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `gp_min_align_steps` | `2` | Minimum number of forward-step phases required before a floor-edge transition is treated as a genuine approach; fewer steps triggers a retry |
-| `gp_early_trigger_max_retries` | `3` | Maximum number of early-trigger retries before aborting |
+| `gp_min_approach_s` | `2.0 s` | Minimum simulation time (seconds) that must elapse from the start of a visual approach attempt before a floor-edge transition is treated as genuine; if elapsed < this value the approach is considered an early trigger and the robot returns home to retry |
+| `gp_early_trigger_max_retries` | `3` | Maximum number of early-trigger retries before falling back to `drive_to_floor_edge` directly |
 
 ### Miscellaneous
 
@@ -374,12 +375,17 @@ The central controller class encapsulates all robot state and all motion primiti
 | `wrist_sensor` | Handle to the wrist orientation sensor used for wrist angle computation |
 | `edge_sensor` | Handle to the down-facing proximity sensor for floor-edge detection |
 | `floor_entity` | Handle to the floor shape (optional; used to narrow proximity sensor checks) |
+| `front_cam` | Handle to the forward-facing RGB vision sensor (`frontCam`); used by `detect_goalposts()` |
 | `home_dummy` | Scene dummy placed at (0,0,0) — used as a navigation target for home return |
 | `attached_object` | Handle of the currently held object, or `None` |
 | `_attached_prev_parent` | Parent handle before attachment — restored on release |
 | `_attached_prev_static` | Static flag before attachment — restored on release |
 | `_wrist_latched` | Cached wrist angle for the current pick cycle; cleared at the start of each pick |
 | `_arm_moved` | Boolean flag — set `True` once the arm starts moving, so the `finally` block knows to tuck it back |
+| `collected_cubes` | List of object handles already picked (or attempted) in the current mission; used by `run_mission_loop` to avoid re-picking |
+| `_gp_last_seen_t` | Simulation time when both goal posts were last simultaneously detected; used for terminal-hold timing in `drive_to_dropzone_visual` |
+| `_gp_last_err_px` | Last known gate-centre pixel error when both posts were visible; used as fallback during terminal hold |
+| `_gp_last_sep_px` | EMA-smoothed inter-post pixel separation; used to estimate gate centre when only one post is visible |
 
 ---
 
@@ -420,6 +426,9 @@ Polls the down-facing proximity sensor via `sim.checkProximitySensor`. Returns `
 
 **`get_front_cam_rgb()`**
 Captures a fresh RGB image from the forward-facing vision sensor (`frontCam`). Calls `sim.handleVisionSensor` to ensure the image is up-to-date, then calls `sim.getVisionSensorImg` and converts the raw byte buffer to a flat `[R,G,B, R,G,B, …]` integer list. Returns `(rgb_list, width, height)`.
+
+**`_centroid_rgb_threshold(rgb, w, h, mn, mx)`**
+Internal helper called by `detect_goalposts()`. Scans the image pixel-by-pixel (with optional stride `gp_stride` and a configurable vertical band `gp_y0_frac`–`gp_y1_frac`) and computes the horizontal centroid (`cx`) and total pixel count of all pixels whose RGB values fall within the `[mn, mx]` colour box. Returns `(cx, count)`; returns `(None, 0)` if no matching pixels are found.
 
 **`detect_goalposts()`**
 Analyses the most recent camera image to locate the green and red goal posts that mark the drop-off area. For each colour it computes the horizontal centroid (`cx`) and pixel count (`n`) of all pixels whose RGB values fall within the configured min/max thresholds. Returns:
@@ -486,7 +495,7 @@ Camera-guided approach to the drop-off area using the two coloured goal posts as
 - Triggered when the posts grow very large (`gp_near_pixels`) or both posts disappear after the robot was previously aligned. The robot continues forward at `gp_final_forward_speed` for up to `gp_lost_hold_s` seconds, relying on the edge sensor for the final stop.
 
 *Early-trigger retry:*
-- If the edge is reached after fewer than `gp_min_align_steps` forward steps (robot started too close to the posts), the approach is considered a false trigger. The robot returns home and restarts the visual search. Up to `gp_early_trigger_max_retries` retries are attempted before aborting.
+- If the edge is reached before `gp_min_approach_s` seconds have elapsed since the start of the current attempt (robot started too close to the posts), the approach is considered a false trigger. The robot stops and returns home, then restarts the visual search. Up to `gp_early_trigger_max_retries` retries are attempted; if all retries are exhausted, `drive_to_floor_edge()` is called directly as a fallback.
 
 **`return_base_to_world_origin()`**
 Convenience sequencer: calls `turn_to_face_target` then `drive_to_stop` targeting the `home_dummy` at (0,0,0).
@@ -599,29 +608,33 @@ Called after the robot is positioned at the floor edge:
 #### 6.3.12 Mission Execution
 
 **`pick_and_drop_one(target_handle)`**
-Full single-object pick-carry-drop-return cycle in a guaranteed-cleanup `try/finally` block:
+Full single-object pick-carry-drop cycle in a guaranteed-cleanup `try/finally` block:
 
 ```
 turn to face target
-→ drive to stop distance
-→ go_pregrip
-→ pause at pregrip
-→ go_grip_ready
-→ close gripper until confirmed
-→ return arm to neutral
-→ drive to floor edge
-→ drop cuboid off edge
-→ go tucked pose
-→ return base to world origin
+→ drive to stop distance        (clearance-based stop)
+→ go_pregrip                    (arm phases A + B; wrist computed here)
+→ pause at pregrip              (pregrip_pause_s seconds)
+→ go_grip_ready                 (interpolated descent)
+→ close gripper until confirmed (incremental closure; attaches object on confirm)
+→ return arm to neutral         (carry pose)
+→ drive_to_dropzone_visual()    (frontCam visual servo to goal-post gate → floor edge)
+→ drive_to_floor_edge()         (edge-sensor confirmation after visual approach)
+→ drop_cuboid_off_edge()        (open gripper, detach, reverse)
+→ go_tucked_pose()              (compact stow)
 ```
 
 `finally` block: stops the base, detaches any held object, and if `_arm_moved` is True (arm was extended when an exception occurred), executes an emergency tuck.
 
 **`run_mission_loop()`**
-Iterates through `CFG["pick_targets"]` in order. For each target:
-- Resolves the scene handle. If the object does not exist (`getObject` returns −1), logs a skip message and continues.
-- Calls `pick_and_drop_one()`.
-- On exception, logs the full traceback and continues to the next target rather than aborting the entire mission.
+Greedy closest-first mission loop. On each iteration:
+1. Builds a list of all `CFG["pick_targets"]` whose scene handle exists **and** whose handle is not yet in `self.collected_cubes`.
+2. Selects the **closest** candidate by planar XY distance from the robot's base reference frame.
+3. Calls `pick_and_drop_one()` for the selected target.
+4. On success, appends the handle to `collected_cubes`; on exception, logs the full traceback, also appends the handle (to avoid infinite retry on a broken object), and continues to the next iteration.
+5. Terminates when `candidates` is empty (all targets collected or unavailable).
+
+The robot does **not** return to the world origin between picks; after dropping a cuboid and tucking its arm, it immediately proceeds to the next closest available target.
 
 ---
 
@@ -634,22 +647,23 @@ sysCall_init()
 sysCall_thread()
   └─ wait 0.2 s             ← let physics settle
   └─ run_mission_loop()
-       └─ FOR EACH cuboid in pick_targets:
-            turn_to_face_target()
-            drive_to_stop()              ← approach with clearance-based stop
-            go_pregrip()                 ← arm phases A + B (wrist computed here)
-            pause 2.5 s                  ← settle at hover
-            go_grip_ready()              ← interpolated descent
-            close_gripper()              ← incremental closure until confirmed
-            attach_object_to_grip()      ← object parented, frozen, non-respondable
-            return_arm_to_neutral()      ← carry pose
-            drive_to_dropzone_visual()   ← frontCam visual servo to goal-post gate
-                                            → Stage A: align + step-drive toward posts
-                                            → Stage B: terminal hold to floor edge
-            backoff (brief)
-            drop_cuboid_off_edge()       ← open gripper, detach, reverse
-            go_tucked_pose()             ← compact stow
-            return_base_to_world_origin()  ← home: turn then drive
+       └─ LOOP until no uncollected targets remain:
+            select closest uncollected cuboid by planar XY distance
+            ├─ turn_to_face_target()
+            ├─ drive_to_stop()              ← approach with clearance-based stop
+            ├─ go_pregrip()                 ← arm phases A + B (wrist computed here)
+            ├─ pause 2.5 s                  ← settle at hover
+            ├─ go_grip_ready()              ← interpolated descent
+            ├─ close_gripper()              ← incremental closure until confirmed
+            ├─ attach_object_to_grip()      ← object parented, frozen, non-respondable
+            ├─ return_arm_to_neutral()      ← carry pose
+            ├─ drive_to_dropzone_visual()   ← frontCam visual servo to goal-post gate
+            │    Stage A: align + step-drive toward posts (visual servo)
+            │    Stage B: terminal hold to floor edge (lost-hold or near-pixels trigger)
+            │    Early-trigger retry: if edge hit too soon → return home, restart search
+            ├─ drive_to_floor_edge()        ← edge-sensor confirmation after visual approach
+            ├─ drop_cuboid_off_edge()       ← open gripper, detach, reverse
+            └─ go_tucked_pose()             ← compact stow; proceed directly to next target
 
 sysCall_cleanup()
   └─ stop_base()            ← ensure wheels stopped on sim end
@@ -658,6 +672,9 @@ sysCall_cleanup()
 ---
 
 ## 8. Key Algorithms and Design Decisions
+
+### Greedy Closest-First Pick Order
+Rather than picking cuboids in a fixed list order, `run_mission_loop` always selects the nearest uncollected target by planar XY distance from the current robot position. This minimises total travel distance and makes the mission robust to object positions that differ from a pre-defined sequence. A `collected_cubes` list tracks handles that have been successfully picked (or attempted but failed) so that no target is re-approached.
 
 ### Mecanum Omnidirectional Kinematics
 The robot uses standard mecanum inverse kinematics with a constant `L = lx + ly` (sum of half-wheelbase and half-track). Commands are expressed as body-frame twists `(vx, vy, ω)` and converted to individual wheel velocities per the standard formula. Only `vx` and `ω` are used in practice (no lateral `vy` component), since the navigation strategy is turn-then-drive.
