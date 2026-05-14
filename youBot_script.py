@@ -1528,9 +1528,7 @@ class YouBotPickController:
                             aliases.append(str(c))
                     log_info(f"[mission] collected {len(self.collected_cubes)} cube(s): {aliases}")
                 except GripTimeoutError as e:
-                    log_info(
-                        f"[mission] grip timeout on {best_path}: {e}\n{traceback.format_exc()}"
-                    )
+                    log_info(f"[mission] grip timeout on {best_path}: {e}")
                     # Cube was not attached — keep it on the target list and return home
                     log_info(f"[mission] returning home; {best_path} will be retried")
                     try:
