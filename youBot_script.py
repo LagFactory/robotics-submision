@@ -248,6 +248,13 @@ class StepLogger:
 
 
 # -----------------------------
+# Custom exceptions
+# -----------------------------
+class GripTimeoutError(RuntimeError):
+    """Raised when the gripper close timeout is reached without the object being attached."""
+
+
+# -----------------------------
 # Math helpers
 # -----------------------------
 def clamp(x, lo, hi):
@@ -1232,7 +1239,7 @@ class YouBotPickController:
             while not sim.getSimulationStopping():
                 if sim.getSimulationTime() - t_start > timeout:
                     j1, j2 = self.get_gripper_positions()
-                    raise RuntimeError(
+                    raise GripTimeoutError(
                         f"Gripper close timeout. Current j1={j1:.4f}, j2={j2:.4f} "
                         f"(goals: j1={CFG['gripper_close_goal_j1']:.4f}, "
                         f"j2={CFG['gripper_close_goal_j2']:.4f})"
@@ -1520,6 +1527,15 @@ class YouBotPickController:
                         except Exception:
                             aliases.append(str(c))
                     log_info(f"[mission] collected {len(self.collected_cubes)} cube(s): {aliases}")
+                except GripTimeoutError as e:
+                    log_info(f"[mission] grip timeout on {best_path}: {e}")
+                    # Cube was not attached — keep it on the target list and return home
+                    log_info(f"[mission] returning home; {best_path} will be retried")
+                    try:
+                        self.return_base_to_world_origin()
+                    except Exception as home_err:
+                        log_info(f"[mission] return-to-home failed: {home_err}")
+                    continue
                 except Exception as e:
                     log_info(
                         f"[mission] failed on {best_path}: {e}\n{traceback.format_exc()}"
