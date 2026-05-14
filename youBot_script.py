@@ -173,6 +173,15 @@ CFG = {
                                         # (if elapsed < this, it's an early trigger)
     "gp_early_trigger_max_retries": 3, # how many times to retry after an early trigger
 
+    # Minimum inter-post separation (as a fraction of image width) that must be
+    # observed while *both* posts are simultaneously visible before an approach
+    # attempt is considered valid.  A small separation means the robot is viewing
+    # the gate from a steep side-angle; requiring a minimum separation ensures the
+    # robot is roughly centred in front of the gate before it is allowed to commit
+    # to the floor-edge drive.  If this condition is not met, the robot returns
+    # home and restarts the visual search (same retry logic as the time-gate).
+    "gp_min_sep_frac": 0.25,           # gate must span at least this fraction of img_w
+
 }
 
 
@@ -620,6 +629,10 @@ class YouBotPickController:
                 self._gp_last_sep_px  = None
 
                 _early_trigger = False  # set True when retry is needed
+                # True once both posts have been seen simultaneously with
+                # sufficient angular separation (not a steep side-on view).
+                # All exit-to-edge paths are gated on this flag.
+                _gp_both_seen_valid = False
 
                 while not sim.getSimulationStopping():
                     if sim.getSimulationTime() - t0 > timeout:
@@ -634,17 +647,20 @@ class YouBotPickController:
 
                     if lost >= lost_needed:
                         elapsed = sim.getSimulationTime() - t0
-                        if elapsed < min_approach_s and _attempt < max_retries:
+                        if (elapsed < min_approach_s or not _gp_both_seen_valid) and _attempt < max_retries:
                             log_info(
-                                f"[gp] Edge reached but time gate not elapsed "
-                                f"(elapsed={elapsed:.2f}s < {min_approach_s}s, "
+                                f"[gp] Edge reached but approach not valid "
+                                f"(elapsed={elapsed:.2f}s, "
+                                f"both_seen_valid={_gp_both_seen_valid}, "
                                 f"attempt {_attempt + 1}/{max_retries}): "
-                                "triggering retry instead of committing to floor edge"
+                                "returning home to retry — both posts must be seen "
+                                "with sufficient separation before committing to edge"
                             )
                             self.stop_base()
                             _early_trigger = True
                             break
-                        # Time gate elapsed or retries exhausted — commit to the edge.
+                        # Approach validated (both posts seen with good separation and
+                        # time gate elapsed) or retries exhausted — commit to the edge.
                         self.stop_base()
                         sim.wait(CFG["post_stop_settle_s"])
                         if CFG["edge_backoff_s"] > 0:
@@ -669,6 +685,12 @@ class YouBotPickController:
                                 gp_sep_decay * self._gp_last_sep_px
                                 + (1.0 - gp_sep_decay) * sep
                             )
+                        # Mark this attempt as valid once the gate spans at least
+                        # gp_min_sep_frac of the image width.  A very small separation
+                        # means the robot is viewing from a steep side-on angle and
+                        # should not yet be allowed to commit to the edge drive.
+                        if sep >= CFG["gp_min_sep_frac"] * img_w:
+                            _gp_both_seen_valid = True
                         # Only commit to the approach (activate HOLD) once the gate
                         # has been stably centred for enough consecutive frames.
                         # A fleeting glimpse during the search sweep (stable < stable_needed)
@@ -691,13 +713,15 @@ class YouBotPickController:
                         )
                         if one_post_big:
                             elapsed = sim.getSimulationTime() - t0
-                            if elapsed < min_approach_s and _attempt < max_retries:
+                            if (elapsed < min_approach_s or not _gp_both_seen_valid) and _attempt < max_retries:
                                 log_info(
-                                    f"[gp] Near-stop early trigger: single post pixel count "
-                                    f"n_g={n_g} n_r={n_r} >= {gp_near_pixels} but only "
-                                    f"{elapsed:.2f}s elapsed (< {min_approach_s}s, "
+                                    f"[gp] Near-stop: single post pixel count "
+                                    f"n_g={n_g} n_r={n_r} >= {gp_near_pixels} but approach "
+                                    f"not valid (elapsed={elapsed:.2f}s, "
+                                    f"both_seen_valid={_gp_both_seen_valid}, "
                                     f"attempt {_attempt + 1}/{max_retries}): "
-                                    "returning home to retry search"
+                                    "returning home to retry — both posts must be seen "
+                                    "with sufficient separation before committing to edge"
                                 )
                                 self.stop_base()
                                 _early_trigger = True
@@ -767,18 +791,19 @@ class YouBotPickController:
                             # If we previously acquired both posts but have now lost them
                             # beyond the hold window, we must be close to the gate.
                             if self._gp_last_seen_t > 0:
-                                # Early-trigger check: if not enough sim time has passed
-                                # since the start of this attempt, the robot was likely
-                                # already very close when it first spotted the posts and
-                                # committed too soon.  Return home and restart the visual
-                                # search instead of driving blindly to the edge.
+                                # Guard: only commit to the edge if the approach is valid
+                                # (both posts were seen simultaneously with sufficient
+                                # separation, confirming a roughly centred approach angle)
+                                # OR if retries are exhausted.
                                 elapsed = t_now - t0
-                                if elapsed < min_approach_s and _attempt < max_retries:
+                                if (elapsed < min_approach_s or not _gp_both_seen_valid) and _attempt < max_retries:
                                     log_info(
-                                        f"[gp] Early trigger detected "
-                                        f"(elapsed={elapsed:.2f}s < {min_approach_s}s, "
+                                        f"[gp] Hold-timeout: approach not valid "
+                                        f"(elapsed={elapsed:.2f}s, "
+                                        f"both_seen_valid={_gp_both_seen_valid}, "
                                         f"attempt {_attempt + 1}/{max_retries}): "
-                                        "returning home to retry search"
+                                        "returning home to retry — both posts must be seen "
+                                        "with sufficient separation before committing to edge"
                                     )
                                     self.stop_base()
                                     _early_trigger = True
